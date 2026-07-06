@@ -3,8 +3,8 @@
   "build": 2432,
   "published_at": "2026-07-06",
   "installer_url": "https://github.com/linkjiyeon-gif/xiaolin-assistant-updates/releases/download/v2.4.32/XiaoLinAssistant_Setup_v2.4.32.exe",
-  "size": 35512270,
-  "sha256": "d7e93110c5bfff337741f7c2fdd40d2cf443b7e9bc0e55a44626d1595ec5ded0",
+  "size": 35512279,
+  "sha256": "25c36cec72e8a26d5ec5d79d4910d8ff5723f9bf74c3836717c29331a75d227d",
   "release_notes": [
     "新增基于 GitHub Releases 的在线更新功能",
     "支持后台检查、下载进度、取消下载和稍后更新",
