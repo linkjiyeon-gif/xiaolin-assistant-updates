@@ -1,0 +1,33 @@
+QA 测试工具盒 v2.4.32 - GitHub 在线更新第一阶段
+================================================
+
+更新源
+------
+公开仓库：
+https://github.com/linkjiyeon-gif/xiaolin-assistant-updates
+
+客户端清单：
+https://raw.githubusercontent.com/linkjiyeon-gif/xiaolin-assistant-updates/main/latest.json
+
+工作流程
+--------
+1. 主界面完成首次绘制后，在后台检查 latest.json。
+2. 用户确认后下载 GitHub Release 中的完整 Setup 安装包。
+3. 下载完成后校验文件大小和 SHA-256。
+4. 将独立更新器复制到临时目录并启动。
+5. 主程序正常释放日志、ADB、托盘等资源后退出。
+6. 更新器执行 Inno Setup 静默覆盖安装。
+7. 安装成功后重新启动测试助手。
+
+发布顺序
+--------
+1. 构建并测试正式 Setup 安装包。
+2. 创建 Draft Release 并上传安装包。
+3. 发布 Release 并验证公开下载地址。
+4. 计算并确认安装包大小与 SHA-256。
+5. 最后提交 latest.json。
+
+注意
+----
+v2.4.32 是在线更新引导版本。旧版没有检查更新代码，因此需要先手动安装
+v2.4.32；以后发布 v2.4.33 及更高版本时即可在工具内完成在线升级。

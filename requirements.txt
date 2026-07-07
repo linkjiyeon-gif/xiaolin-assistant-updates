@@ -1,0 +1,9 @@
+customtkinter
+pillow
+pynput
+pydivert
+python-docx
+openpyxl
+PyPDF2
+PyYAML
+pystray

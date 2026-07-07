@@ -1,0 +1,253 @@
+﻿QA测试工具盒 v2.4.33 安装帮助说明
+=================================
+
+一、安装方式选择
+----------------
+
+QA测试工具盒支持三种使用方式：
+1. 源码运行：双击 run.bat
+2. 打包 EXE：双击 build_exe.bat，生成 dist\XiaoLinAssistant.exe
+3. 安装程序：双击 build_installer.bat，生成 Output\XiaoLinAssistant_Setup_v2.4.33.exe
+
+如果只是自己临时使用，可以用 run.bat 或 dist 中的 EXE。
+如果要分发给测试同事，建议使用安装程序。
+
+
+二、运行环境要求
+----------------
+
+支持系统：
+- Windows 10
+- Windows 11
+
+源码运行 / 重新打包需要：
+- Python 3.10 - 3.13
+
+生成安装程序需要额外安装：
+- Inno Setup 6
+
+仅安装并使用最终 Setup.exe 时，不需要安装 Python 和 Inno Setup。
+
+
+三、源码方式运行
+----------------
+
+1. 完整解压工具包，不要在压缩包预览窗口中运行。
+2. 双击 run.bat。
+3. 首次运行会安装 Python 依赖，可能需要几分钟。
+
+如果双击 run.bat 闪退，可以在当前目录打开终端，手动执行：
+
+python -m pip install -r requirements.txt
+python xiaoxin_assistant.py
+
+
+四、打包 EXE
+------------
+
+1. 完整解压工具包。
+2. 双击 build_exe.bat。
+3. 等待脚本执行完成。
+4. 成功后会生成：
+
+   dist\XiaoLinAssistant.exe
+
+如果打包失败，请查看：
+
+   build_log.txt
+
+
+五、生成 Windows 安装程序
+-------------------------
+
+生成安装程序前，请先安装 Inno Setup 6。
+
+安装 Inno Setup 后，双击：
+
+   build_installer.bat
+
+脚本会自动执行：
+1. 调用 build_exe.bat 生成 XiaoLinAssistant.exe
+2. 调用 Inno Setup 编译安装程序
+3. 输出安装包
+
+成功后会生成：
+
+   Output\XiaoLinAssistant_Setup_v2.4.33.exe
+
+如果生成失败，请查看：
+
+   build_installer_log.txt
+
+
+六、安装程序说明
+----------------
+
+安装程序支持：
+- 选择安装目录
+- 创建开始菜单快捷方式
+- 可选创建桌面快捷方式
+- 安装后可选择立即启动工具箱
+- 支持卸载程序
+- 使用 assets\app.ico 作为安装包和程序图标，图标已更新为新版游戏 QA 工具图标
+
+默认安装目录为当前用户目录：
+
+   %LOCALAPPDATA%\QA测试工具盒
+
+这样可以避免强制管理员权限安装。
+
+
+七、安装包包含内容
+------------------
+
+安装程序会安装以下内容：
+- XiaoLinAssistant.exe
+- README.txt
+- INSTALL_AND_FIRST_USE.txt
+- assets\app.ico
+- assets\app.png
+- tools\ios\README.txt
+
+注意：
+安装包默认不会内置第三方 iOS 工具 exe，例如：
+- idevice_id.exe
+- ideviceinfo.exe
+- idevicesyslog.exe
+- idevicecrashreport.exe
+
+如需使用 iOS 日志抓取，请用户自行下载 libimobiledevice 工具，并在工具箱内配置路径。
+
+
+八、管理员权限说明
+------------------
+
+以下功能需要或建议使用管理员权限：
+- 网络弱网
+- WinDivert 抓包 / 丢包 / 延迟
+
+工具箱左下角有“管理员重启”按钮。
+点击后会请求 Windows UAC 权限并重新启动程序。
+
+如果当前已经是管理员权限，工具会提示“当前已是管理员权限”。
+如果用户取消 UAC 授权，程序不会崩溃。
+
+
+九、ADB 功能配置
+----------------
+
+ADB 日志抓取、ADB 工具、截图、录屏、APK 安装等功能需要电脑能执行 adb。
+
+推荐方式：
+1. 安装 Android SDK Platform-Tools。
+2. 将 adb.exe 所在目录加入系统环境变量 PATH。
+3. 重新打开工具箱。
+
+也可以把 adb.exe 放到工具箱目录下，程序会优先使用本地 adb.exe。
+
+检查 ADB 是否可用：
+
+adb devices
+
+状态说明：
+- device：设备正常连接
+- unauthorized：需要在手机上允许 USB 调试授权
+- offline：建议重新插拔数据线、重启 adb 或重新授权
+
+
+十、iOS 日志功能配置
+--------------------
+
+iOS 日志抓取依赖用户本地安装的 libimobiledevice 工具。
+
+建议工具目录：
+
+   tools\ios\
+
+可配置工具：
+- idevice_id.exe
+- ideviceinfo.exe
+- idevicesyslog.exe
+- idevicecrashreport.exe
+
+Windows 还需要能识别 iPhone / iPad，通常需要安装 Apple Mobile Device Support / iTunes 驱动。
+首次连接设备时，请在 iPhone / iPad 上点击“信任此电脑”。
+
+
+十一、常见问题
+--------------
+
+1. build_installer.bat 提示找不到 ISCC.exe
+
+处理方式：
+- 安装 Inno Setup 6
+- 或将 ISCC.exe 加入系统 PATH
+- 常见路径：C:\Program Files (x86)\Inno Setup 6\ISCC.exe
+
+2. 安装后弱网功能无法使用
+
+处理方式：
+- 在工具箱左下角点击“管理员重启”
+- 确认安全软件没有拦截 WinDivert
+
+3. 安装后 ADB 检测不到设备
+
+处理方式：
+- 确认手机开启 USB 调试
+- 确认电脑可以执行 adb devices
+- 重新插拔数据线
+- 重新授权 USB 调试
+
+4. 安装后 iOS 日志检测不到设备
+
+处理方式：
+- 确认已连接 iPhone / iPad
+- 确认设备上已点击“信任此电脑”
+- 确认已安装 Apple 驱动
+- 确认 idevice_id.exe、ideviceinfo.exe、idevicesyslog.exe 路径配置正确
+
+5. 图标显示异常
+
+处理方式：
+- 确认 assets\app.ico 和 assets\app.png 存在
+- 重新使用 build_exe.bat 或 build_installer.bat 打包
+- Windows 可能缓存旧图标，可尝试重命名 EXE 或重新安装
+
+
+十二、时间测试工具说明
+----------------------
+
+时间测试工具用于测试人员快速处理活动、礼包、通行证、任务、倒计时、服务器时间和日志时间。
+
+支持能力：
+- 时间戳转日期时间，自动识别 10 位秒级和 13 位毫秒级时间戳
+- 日期时间转秒级 / 毫秒级时间戳，支持本地时区、UTC、UTC+8 和自定义 UTC 偏移
+- 秒、分钟、小时、天、周、月、年互转，月按 30 天估算，年按 365 天估算
+- 开始时间与结束时间差值计算，支持判断结束时间是否早于开始时间
+- 指定时间增加 / 减少固定时长；时间加减页已去掉单位下拉框，可直接填写天、时、分、秒后自动换算总秒数
+- 结束时间倒计时校验，结束后显示“已结束”
+- 跨天、跨周、跨月关键边界时间计算
+
+注意：
+- 工具只读取本机当前时间用于计算，不会修改系统时间
+- 所有计算均在本地完成，不联网、不上传数据
+
+十三、推荐分发流程
+------------------
+
+给同事分发时建议：
+1. 在开发机上完整解压工具包。
+2. 安装 Inno Setup 6。
+3. 双击 build_installer.bat。
+4. 等待生成 Output\XiaoLinAssistant_Setup_v2.4.33.exe。
+5. 将该 Setup.exe 发给同事。
+6. 同事双击安装即可。
+
+注意：
+- 安装程序本身不联网、不上传数据。
+- 工具运行时也不会上传测试文件、日志或配置表。
+- iOS 第三方工具 exe 不默认内置，需要用户自行配置。
+
+
+补充说明：
+- 顶部状态标识已优化，普通首页不再固定显示“已就绪”；需要管理员权限的网络弱网页会根据当前权限显示“已就绪”或“需管理员”。
