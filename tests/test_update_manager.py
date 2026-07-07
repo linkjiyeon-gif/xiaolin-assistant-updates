@@ -44,8 +44,8 @@ class FakeResponse:
 
 class UpdateManagerTests(unittest.TestCase):
     def test_single_version_source(self):
-        self.assertEqual("2.4.33", APP_VERSION)
-        self.assertEqual(2433, APP_BUILD)
+        self.assertEqual("2.4.34", APP_VERSION)
+        self.assertEqual(2434, APP_BUILD)
 
     def test_version_comparison(self):
         self.assertTrue(is_newer_version("2.4.33", "2.4.32"))
