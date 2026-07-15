@@ -4,6 +4,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass
 from typing import Dict, List, Optional, Sequence
@@ -60,6 +61,72 @@ def safe_filename(text: str, fallback: str = "unknown") -> str:
     return re.sub(r"[^0-9A-Za-z._\-\u4e00-\u9fff]+", "_", value).strip("_") or fallback
 
 
+_RESOLUTION_PAIR = r"(\d+)\s*[xX×]\s*(\d+)"
+
+
+def _format_resolution(width: str, height: str) -> str:
+    try:
+        width_value = int(width)
+        height_value = int(height)
+    except (TypeError, ValueError):
+        return ""
+    if width_value <= 0 or height_value <= 0:
+        return ""
+    return f"{width_value} × {height_value}"
+
+
+def parse_device_resolution(text: str) -> str:
+    """Parse the active Android display resolution from adb command output.
+
+    ``wm size`` can contain both a physical and an override value.  The
+    override is the active value and therefore always wins.  The additional
+    patterns cover common ``dumpsys display`` output without binding the
+    parser to a device model or a fixed resolution.
+    """
+
+    value = str(text or "").replace("\u00a0", " ")
+    if not value.strip():
+        return ""
+
+    def match_pair(pattern: str, flags: int = re.IGNORECASE | re.DOTALL) -> str:
+        match = re.search(pattern, value, flags)
+        return _format_resolution(match.group(1), match.group(2)) if match else ""
+
+    # wm size: prefer the currently effective override over the panel size.
+    for pattern in (
+        rf"override\s*size\s*[:=]\s*{_RESOLUTION_PAIR}",
+        rf"override[^\r\n]*?{_RESOLUTION_PAIR}",
+    ):
+        resolution = match_pair(pattern)
+        if resolution:
+            return resolution
+
+    for pattern in (
+        rf"physical\s*size\s*[:=]\s*{_RESOLUTION_PAIR}",
+        rf"physical[^\r\n]*?{_RESOLUTION_PAIR}",
+    ):
+        resolution = match_pair(pattern)
+        if resolution:
+            return resolution
+
+    # Common dumpsys display layouts across Android versions.
+    for pattern in (
+        rf"(?:mCurrentDisplayRect|mDisplayRect)\s*=\s*Rect\(\s*0\s*,\s*0\s*-\s*(\d+)\s*,\s*(\d+)\s*\)",
+        r"(?:logical|device|display)Width\s*=\s*(\d+).*?(?:logical|device|display)Height\s*=\s*(\d+)",
+        rf"(?:real|active|current|native|resolution|display\s*size)\s*[:=]?\s*{_RESOLUTION_PAIR}",
+        rf"(?:mBaseDisplayInfo|DisplayDeviceInfo)[^\r\n]*?{_RESOLUTION_PAIR}",
+    ):
+        resolution = match_pair(pattern)
+        if resolution:
+            return resolution
+
+    # Some vendor versions return only one unlabelled dimension pair.
+    pairs = re.findall(_RESOLUTION_PAIR, value, re.IGNORECASE)
+    normalized = {_format_resolution(width, height) for width, height in pairs}
+    normalized.discard("")
+    return next(iter(normalized)) if len(normalized) == 1 else ""
+
+
 @dataclass
 class CommandResult:
     command: List[str]
@@ -90,6 +157,7 @@ class ADBDeviceInfo:
     brand: str = ""
     android_version: str = ""
     sdk: str = ""
+    resolution: str = "未知"
     foreground_package: str = ""
     foreground_activity: str = ""
     is_emulator: bool = False
@@ -100,7 +168,7 @@ class ADBDeviceInfo:
     def label(self) -> str:
         model = self.model or self.device or self.product or "未知设备"
         version = f"Android {self.android_version}" if self.android_version else "Android ?"
-        return f"{self.serial}｜{model}｜{version}｜{self.status}"
+        return f"{self.serial}｜{model}｜{version}｜{self.resolution or '未知'}｜{self.status}"
 
     def to_dict(self) -> Dict[str, object]:
         data = asdict(self)
@@ -131,6 +199,8 @@ class ADBTools:
         self._recording: Optional[RecordingSession] = None
         self.selected_serial: str = ""
         self._last_devices: List[ADBDeviceInfo] = []
+        self._resolution_cache: Dict[str, str] = {}
+        self._resolution_cache_lock = threading.RLock()
 
     def adb_path(self) -> str:
         local_adb = resource_path("adb.exe")
@@ -237,14 +307,17 @@ class ADBTools:
             devices.append(info)
         return devices
 
-    def list_devices(self, detailed: bool = True) -> Dict[str, object]:
+    def list_devices(self, detailed: bool = True, refresh_resolutions: bool = False) -> Dict[str, object]:
         result = self._run_raw(["devices", "-l"], timeout=8)
         result = self._normalize_adb_error(result)
         devices = self._parse_devices_output(result.stdout)
+        self._prune_resolution_cache(item.serial for item in devices)
         if detailed:
             for device in devices:
                 if device.status == "device":
-                    self._fill_device_details(device)
+                    self._fill_device_details(device, refresh_resolution=refresh_resolutions)
+                else:
+                    device.resolution = "未知"
         self._last_devices = devices
         ready = [item for item in devices if item.status == "device"]
         if self.selected_serial and not any(item.serial == self.selected_serial and item.status == "device" for item in devices):
@@ -258,7 +331,7 @@ class ADBTools:
             "ready_count": len(ready),
         }
 
-    def _fill_device_details(self, device: ADBDeviceInfo) -> None:
+    def _fill_device_details(self, device: ADBDeviceInfo, refresh_resolution: bool = False) -> None:
         def prop(name: str) -> str:
             res = self._run_raw(["-s", device.serial, "shell", "getprop", name], timeout=6, serial=device.serial)
             return (res.stdout or "").strip()
@@ -267,6 +340,10 @@ class ADBTools:
         device.brand = prop("ro.product.brand")
         device.android_version = prop("ro.build.version.release")
         device.sdk = prop("ro.build.version.sdk")
+        if refresh_resolution:
+            device.resolution = self.get_device_resolution(device.serial, force_refresh=True)
+        else:
+            device.resolution = self.get_cached_device_resolution(device.serial)
         fg = self.get_foreground_app(serial=device.serial, ensure=False)
         device.foreground_package = fg.get("package", "")
         device.foreground_activity = fg.get("activity", "")
@@ -290,6 +367,7 @@ class ADBTools:
                 f"{prefix} {item.get('serial')} | {item.get('status')} | "
                 f"{item.get('model') or item.get('device') or '未知型号'} | "
                 f"Android {item.get('android_version') or '?'} | "
+                f"分辨率 {item.get('resolution') or '未知'} | "
                 f"{item.get('connection') or ''} | 前台：{item.get('foreground_package') or '-'}"
             )
         ready = [item for item in devices if item.get("status") == "device"]
@@ -352,6 +430,54 @@ class ADBTools:
 
     def get_prop(self, prop: str, serial: Optional[str] = None) -> str:
         return self.run(["shell", "getprop", prop], timeout=8, serial=serial).stdout.strip()
+
+    def get_cached_device_resolution(self, serial: str) -> str:
+        target = str(serial or "").strip()
+        if not target:
+            return "未知"
+        with self._resolution_cache_lock:
+            return self._resolution_cache.get(target, "未知")
+
+    def clear_resolution_cache(self, serial: Optional[str] = None) -> None:
+        target = str(serial or "").strip()
+        with self._resolution_cache_lock:
+            if target:
+                self._resolution_cache.pop(target, None)
+            else:
+                self._resolution_cache.clear()
+
+    def _prune_resolution_cache(self, connected_serials) -> None:
+        connected = {str(serial or "").strip() for serial in connected_serials if str(serial or "").strip()}
+        with self._resolution_cache_lock:
+            stale = [serial for serial in self._resolution_cache if serial not in connected]
+            for serial in stale:
+                self._resolution_cache.pop(serial, None)
+
+    def get_device_resolution(self, serial: str, force_refresh: bool = False) -> str:
+        """Return a serial-bound, display-ready resolution with fallback and cache."""
+
+        target = str(serial or "").strip()
+        if not target:
+            return "未知"
+        with self._resolution_cache_lock:
+            if not force_refresh and target in self._resolution_cache:
+                return self._resolution_cache[target]
+
+        wm_result = self._normalize_adb_error(
+            self._run_raw(["-s", target, "shell", "wm", "size"], timeout=8, serial=target)
+        )
+        resolution = parse_device_resolution(wm_result.output)
+
+        if not resolution:
+            display_result = self._normalize_adb_error(
+                self._run_raw(["-s", target, "shell", "dumpsys", "display"], timeout=10, serial=target)
+            )
+            resolution = parse_device_resolution(display_result.output)
+
+        display_value = resolution or "获取失败"
+        with self._resolution_cache_lock:
+            self._resolution_cache[target] = display_value
+        return display_value
 
     _FOREGROUND_LINE_KEYS = (
         "mCurrentFocus",
@@ -455,8 +581,7 @@ class ADBTools:
             "SDK 版本": self.get_prop("ro.build.version.sdk", serial=target),
             "CPU ABI": self.get_prop("ro.product.cpu.abi", serial=target),
         }
-        size = self.run(["shell", "wm", "size"], timeout=8, serial=target).stdout.strip()
-        info["分辨率"] = size.replace("Physical size:", "").strip() if size else ""
+        info["分辨率"] = self.get_device_resolution(target)
         battery = self.run(["shell", "dumpsys", "battery"], timeout=8, serial=target).stdout
         level = re.search(r"level:\s*(\d+)", battery)
         status = re.search(r"status:\s*(\d+)", battery)

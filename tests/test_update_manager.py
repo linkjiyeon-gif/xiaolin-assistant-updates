@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from app.constants import APP_BUILD, APP_VERSION
@@ -44,8 +45,10 @@ class FakeResponse:
 
 class UpdateManagerTests(unittest.TestCase):
     def test_single_version_source(self):
-        self.assertEqual("2.4.34", APP_VERSION)
-        self.assertEqual(2434, APP_BUILD)
+        version_file = Path(__file__).resolve().parents[1] / "version.json"
+        expected = json.loads(version_file.read_text(encoding="utf-8"))
+        self.assertEqual(expected["version"], APP_VERSION)
+        self.assertEqual(expected["build"], APP_BUILD)
 
     def test_version_comparison(self):
         self.assertTrue(is_newer_version("2.4.33", "2.4.32"))

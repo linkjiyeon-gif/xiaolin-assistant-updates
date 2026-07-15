@@ -92,6 +92,15 @@ def safe_int(value, default: int) -> int:
         return default
 
 
+def normalize_identifier(value) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if re.fullmatch(r"[+-]?\d+\.0+", text):
+        return text.split(".", 1)[0]
+    return text
+
+
 def normalize_header(value: str) -> str:
     text = "" if value is None else str(value)
     text = unicodedata.normalize("NFKC", text)
@@ -229,7 +238,7 @@ def parse_translation_table(
     for row_index in range(data_start_index, len(rows)):
         row = rows[row_index]
         row_number = row_index + 1
-        text_id = row[key_col].strip() if key_col < len(row) else ""
+        text_id = normalize_identifier(row[key_col]) if key_col < len(row) else ""
         if not text_id:
             if any(str(cell).strip() for cell in row):
                 invalid_rows.append(row_number)

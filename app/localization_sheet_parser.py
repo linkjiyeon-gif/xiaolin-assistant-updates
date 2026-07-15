@@ -1,13 +1,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date, datetime, time
 from pathlib import Path
 import zipfile
 import xml.etree.ElementTree as ET
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 from .file_readers import FileReadError
-from .translation_compare import find_column, normalize_header
+from .translation_compare import find_column, normalize_header, normalize_identifier
+
+
+def _cell_text(cell) -> str:
+    value = cell.value if hasattr(cell, "value") else cell
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.date().isoformat() if value.time() == time.min else value.isoformat(sep=" ", timespec="seconds")
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, time):
+        return value.isoformat(timespec="seconds")
+    return str(value)
 
 LANGUAGE_SHEET_MAP: Dict[str, str] = {
     "EN": "英语",
@@ -52,6 +66,8 @@ TARGET_CANDIDATES = ["翻译", "Translation", "Target", "Target Text", "译文",
 
 MULTI_SHEET_STRUCTURE = "multi_sheet"
 SINGLE_SHEET_STRUCTURE = "single_sheet"
+MULTI_TABLE_SHEETS_STRUCTURE = "multi_table_sheets"
+MULTI_FILE_DICTIONARY_STRUCTURE = "multi_file_dictionary"
 UNKNOWN_STRUCTURE = "unknown"
 
 
@@ -63,6 +79,10 @@ def normalize_localization_mode(mode: str) -> str:
     """
     text = str(mode or "").strip().lower()
     text = text.replace(" ", "").replace("\u3000", "").replace("_", "").replace("-", "")
+    if text in {"多文件字典模式", "多文件字典", "字典多文件", "dictionary多文件", "multifiledictionary", "dictionaryfiles"}:
+        return MULTI_FILE_DICTIONARY_STRUCTURE
+    if text in {"多sheet翻译表", "多sheet多语言列", "全部sheet多语言列", "全部sheet", "多版本sheet", "多版本翻译表", "multitablesheets", "allsheets", "alltablesheets"}:
+        return MULTI_TABLE_SHEETS_STRUCTURE
     if text in {"多sheet语言页", "多sheet", "multisheet", "multisheetlanguage", "multisheetlanguages"}:
         return MULTI_SHEET_STRUCTURE
     if text in {"单sheet多语言列", "单sheet", "singlesheet", "singlesheetcolumns", "singlesheetlanguagecolumns"}:
@@ -162,8 +182,8 @@ def _load_xlsx_rows(path: str) -> Dict[str, List[List[str]]]:
             except Exception:
                 pass
             rows: List[List[str]] = []
-            for row in ws.iter_rows(values_only=True):
-                rows.append(["" if cell is None else str(cell).strip() for cell in row])
+            for row in ws.iter_rows():
+                rows.append([_cell_text(cell).strip() for cell in row])
             result[ws.title] = rows
         return result
     finally:
@@ -337,7 +357,7 @@ def parse_multi_sheet_localization(path: str, header_row: int = 0, enabled_langu
             row = rows[row_index]
             if not any(str(cell).strip() for cell in row):
                 continue
-            text_id = row[info.id_col].strip() if info.id_col < len(row) else ""
+            text_id = normalize_identifier(row[info.id_col]) if info.id_col < len(row) else ""
             if not text_id:
                 invalid_rows.append((sheet_name, row_index + 1))
                 continue

@@ -931,6 +931,7 @@ def validation_issues_to_tsv(issues: Sequence[ValidationIssue]) -> str:
 def export_validation_issues_to_excel(issues: Sequence[ValidationIssue], output_path: str) -> None:
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
 
     wb = Workbook()
     ws = wb.active
@@ -950,10 +951,12 @@ def export_validation_issues_to_excel(issues: Sequence[ValidationIssue], output_
         cell.alignment = Alignment(horizontal="center", vertical="center")
     widths = [8, 10, 18, 22, 14, 30, 18, 52, 42, 24, 16]
     for idx, width in enumerate(widths, start=1):
-        ws.column_dimensions[chr(64 + idx)].width = width
+        ws.column_dimensions[get_column_letter(idx)].width = width
     for row in ws.iter_rows(min_row=2):
         for cell in row:
             cell.alignment = Alignment(vertical="top", wrap_text=True)
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
     wb.save(output_path)
 
 

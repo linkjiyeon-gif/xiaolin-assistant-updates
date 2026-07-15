@@ -49,7 +49,9 @@ from app.localization_checker import (
     LocalizationCheckOptions,
     LocalizationColumn,
     check_localization_file,
+    detect_dictionary_language_files,
     detect_language_columns,
+    detect_multi_table_sheet_columns,
     parse_localization_table,
     auto_detect_source_language,
     localization_issues_to_tsv,
@@ -57,6 +59,8 @@ from app.localization_checker import (
     build_single_sheet_preview,
 )
 from app.localization_sheet_parser import (
+    MULTI_FILE_DICTIONARY_STRUCTURE,
+    MULTI_TABLE_SHEETS_STRUCTURE,
     MULTI_SHEET_STRUCTURE,
     SINGLE_SHEET_STRUCTURE,
     UNKNOWN_STRUCTURE,
@@ -968,6 +972,7 @@ class XiaoXinAssistant(ctk.CTk):
         self.loc_length_ratio_var = tk.StringVar(value="0")
         self.loc_search_var = tk.StringVar(value="")
         self.loc_summary_var = tk.StringVar(value="请选择翻译文件后开始检查")
+        self.loc_progress_var = tk.StringVar(value="等待开始")
         self.loc_check_empty_var = tk.BooleanVar(value=True)
         self.loc_check_chinese_var = tk.BooleanVar(value=True)
         self.loc_check_placeholders_var = tk.BooleanVar(value=True)
@@ -982,9 +987,12 @@ class XiaoXinAssistant(ctk.CTk):
         self.loc_language_vars = {}
         self.loc_language_frame = None
         self.loc_rule_detail_frame = None
+        self.loc_progress_bar = None
         self.loc_rules_visible = False
         self.loc_rules_toggle_button = None
         self.loc_detected_headers = []
+        self.loc_multi_table_candidates_cache = []
+        self.loc_multi_table_cache_key = None
         self.loc_all_issues = []
         self.loc_visible_issues = []
         self.loc_is_working = False
@@ -3189,7 +3197,7 @@ class XiaoXinAssistant(ctk.CTk):
 
         def worker():
             try:
-                data = self.adb_tools.list_devices()
+                data = self.adb_tools.list_devices(refresh_resolutions=True)
                 text = self.adb_tools.format_devices_text(data)
                 self.after(0, lambda d=data: self._update_adb_device_choices(d))
                 self._adb_log("ADB 设备检测结果：")
@@ -3728,7 +3736,8 @@ class XiaoXinAssistant(ctk.CTk):
         version = str(item.get("android_version") or "?")
         status = str(item.get("status") or "?")
         connection = str(item.get("connection") or "")
-        return f"{serial} | {model} | Android {version} | {status} | {connection}"
+        resolution = str(item.get("resolution") or "未知")
+        return f"{serial} | {model} | Android {version} | {resolution} | {status} | {connection}"
 
     def _adb_status_colors(self, status):
         value = str(status or "").lower()
@@ -3758,7 +3767,7 @@ class XiaoXinAssistant(ctk.CTk):
         table_frame.grid(row=row, column=0, sticky="nsew", padx=24, pady=(0, 12))
         table_frame.grid_columnconfigure(0, weight=1)
         table_frame.grid_rowconfigure(0, weight=1)
-        columns = ("current", "serial", "model", "brand", "android", "sdk", "status", "connection", "foreground")
+        columns = ("current", "serial", "model", "brand", "android", "sdk", "resolution", "status", "connection", "foreground")
         tree = ttk.Treeview(table_frame, columns=columns, show="headings", style="Xiao.Treeview", height=7)
         headings = {
             "current": "当前",
@@ -3767,11 +3776,12 @@ class XiaoXinAssistant(ctk.CTk):
             "brand": "品牌",
             "android": "Android",
             "sdk": "API",
+            "resolution": "分辨率",
             "status": "状态",
             "connection": "连接方式",
             "foreground": "前台包名",
         }
-        widths = {"current": 52, "serial": 120, "model": 130, "brand": 90, "android": 90, "sdk": 70, "status": 98, "connection": 90, "foreground": 220}
+        widths = {"current": 52, "serial": 120, "model": 130, "brand": 90, "android": 90, "sdk": 70, "resolution": 118, "status": 98, "connection": 90, "foreground": 220}
         for col in columns:
             tree.heading(col, text=headings[col])
             tree.column(col, width=widths[col], minwidth=widths[col], anchor="w", stretch=col == "foreground")
@@ -3817,6 +3827,7 @@ class XiaoXinAssistant(ctk.CTk):
             f"品牌：{item.get('brand') or '未获取'}",
             f"Android 版本：{item.get('android_version') or '未获取'}",
             f"API Level：{item.get('sdk') or '未获取'}",
+            f"分辨率：{item.get('resolution') or '未知'}",
             f"连接方式：{item.get('connection') or '未获取'}",
             f"当前前台包名：{item.get('foreground_package') or '未识别'}",
             f"状态：{status or '未获取'}",
@@ -3853,6 +3864,7 @@ class XiaoXinAssistant(ctk.CTk):
                     item.get("brand") or "",
                     item.get("android_version") or "",
                     item.get("sdk") or "",
+                    item.get("resolution") or "未知",
                     item.get("status") or "",
                     item.get("connection") or "",
                     item.get("foreground_package") or "",
@@ -4080,7 +4092,7 @@ class XiaoXinAssistant(ctk.CTk):
         def worker():
             kill = self.adb_tools.run(["kill-server"], timeout=8)
             start = self.adb_tools.run(["start-server"], timeout=8)
-            return kill, start, self.adb_tools.list_devices()
+            return kill, start, self.adb_tools.list_devices(refresh_resolutions=True)
         def success(result):
             kill, start, data = result
             self._adb_tools_log("ADB 服务已重启" if start.ok else f"ADB 服务重启可能失败：{start.output}")
@@ -4093,7 +4105,7 @@ class XiaoXinAssistant(ctk.CTk):
 
     def adb_tools_check_devices(self):
         def worker():
-            return self.adb_tools.list_devices()
+            return self.adb_tools.list_devices(refresh_resolutions=True)
         def success(data):
             self._update_adb_device_choices(data)
             text = self.adb_tools.format_devices_text(data)
@@ -6202,21 +6214,22 @@ class XiaoXinAssistant(ctk.CTk):
         file_card.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(file_card, text="翻译文件", text_color=COLOR_TEXT, font=self._font(15, "bold")).grid(row=0, column=0, sticky="w", padx=(24, 22), pady=18)
         ctk.CTkEntry(file_card, textvariable=self.loc_file_path_var, state="readonly", height=38, corner_radius=10, fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13)).grid(row=0, column=1, sticky="ew", pady=18)
-        ctk.CTkButton(file_card, text="选择文件", width=110, height=38, corner_radius=12, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, text_color="#FFFFFF", font=self._font(14, "bold"), command=self.select_localization_file).grid(row=0, column=2, padx=(12, 24), pady=18)
+        ctk.CTkButton(file_card, text="选择文件", width=96, height=38, corner_radius=12, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, text_color="#FFFFFF", font=self._font(14, "bold"), command=self.select_localization_file).grid(row=0, column=2, padx=(12, 8), pady=18)
+        ctk.CTkButton(file_card, text="选择文件夹", width=108, height=38, corner_radius=12, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(14, "bold"), command=self.select_localization_folder).grid(row=0, column=3, padx=(0, 24), pady=18)
         self._divider(file_card, 1)
-        ctk.CTkLabel(file_card, textvariable=self.loc_file_status_var, text_color=COLOR_MUTED, font=self._font(13), anchor="w", wraplength=860).grid(row=2, column=0, columnspan=3, sticky="ew", padx=24, pady=(0, 14))
+        ctk.CTkLabel(file_card, textvariable=self.loc_file_status_var, text_color=COLOR_MUTED, font=self._font(13), anchor="w", wraplength=860).grid(row=2, column=0, columnspan=4, sticky="ew", padx=24, pady=(0, 14))
 
         parse_card = self._make_localization_card(basic_tab, row=1)
         parse_card.grid_columnconfigure((0, 1, 2, 3, 4), weight=1)
         self._small_entry(parse_card, 0, 0, "表头所在行", self.loc_header_row_var, "默认 1，多 Sheet 可自动识别")
         self._small_entry(parse_card, 0, 1, "数据起始行", self.loc_data_start_row_var, "默认 2")
         self._small_entry(parse_card, 0, 2, "主键列名", self.loc_key_column_var, "自动识别 ID / #tid / Text ID")
-        self._small_entry(parse_card, 0, 3, "Sheet 名称", self.loc_sheet_var, "单 Sheet 模式使用")
+        self._small_entry(parse_card, 0, 3, "Sheet 名称", self.loc_sheet_var, "单 Sheet 使用；批量模式留空")
         structure_box = ctk.CTkFrame(parse_card, fg_color="transparent")
         structure_box.grid(row=0, column=4, sticky="ew", padx=(0, 24), pady=6)
         structure_box.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(structure_box, text="表格结构", text_color=COLOR_MUTED, font=self._font(12), anchor="w").grid(row=0, column=0, sticky="ew")
-        self.loc_structure_menu = ctk.CTkOptionMenu(structure_box, values=["自动识别", "单 Sheet 多语言列", "多 Sheet 语言页"], variable=self.loc_structure_var, width=170, height=34, fg_color=COLOR_SURFACE_2, button_color=COLOR_SELECTED, button_hover_color=COLOR_HOVER, text_color=COLOR_TEXT, font=self._font(12))
+        self.loc_structure_menu = ctk.CTkOptionMenu(structure_box, values=["自动识别", "单 Sheet 多语言列", "多 Sheet 翻译表", "多 Sheet 语言页", "多文件字典模式"], variable=self.loc_structure_var, width=170, height=34, fg_color=COLOR_SURFACE_2, button_color=COLOR_SELECTED, button_hover_color=COLOR_HOVER, text_color=COLOR_TEXT, font=self._font(12))
         self.loc_structure_menu.grid(row=1, column=0, sticky="ew", pady=(3, 0))
         action = ctk.CTkFrame(parse_card, fg_color="transparent")
         action.grid(row=1, column=0, columnspan=5, sticky="ew", padx=24, pady=(4, 8))
@@ -6226,7 +6239,7 @@ class XiaoXinAssistant(ctk.CTk):
         ctk.CTkButton(action, text="多 Sheet 说明", width=110, height=36, corner_radius=12, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13, "bold"), command=self.show_localization_multisheet_help).pack(side="left")
         self.loc_structure_preview_box = ctk.CTkTextbox(parse_card, height=96, wrap="word", fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER, border_width=1, text_color=COLOR_TEXT, font=self._font(12), corner_radius=12)
         self.loc_structure_preview_box.grid(row=2, column=0, columnspan=5, sticky="ew", padx=24, pady=(0, 14))
-        self._set_textbox_text(self.loc_structure_preview_box, "结构预览：选择翻译文件后点击“识别结构/语言”。支持单 Sheet 多语言列，也支持 EN/DE/FR 等多 Sheet 语言页。")
+        self._set_textbox_text(self.loc_structure_preview_box, "结构预览：选择翻译文件或字典文件夹后点击“识别结构/语言”。支持单 Sheet、多版本 Sheet、多 Sheet 语言页，以及 dictionary_*.xlsx 多文件字典模式。")
 
         language_card = self._make_localization_card(basic_tab, row=2, pady=(0, 0))
         language_card.grid_rowconfigure(2, weight=1)
@@ -6288,7 +6301,11 @@ ID 缺失/多出：以 EN 优先作为基准，检查其他语言页是否缺少
         status_card.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(status_card, text="处理状态", text_color=COLOR_TEXT, font=self._font(15, "bold"), anchor="w").grid(row=0, column=0, sticky="ew", padx=18, pady=(14, 8))
         self.loc_status_box = ctk.CTkTextbox(status_card, height=74, wrap="word", fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER, border_width=1, text_color=COLOR_TEXT, font=self._font(13), corner_radius=12)
-        self.loc_status_box.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 14))
+        self.loc_status_box.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 8))
+        ctk.CTkLabel(status_card, textvariable=self.loc_progress_var, text_color=COLOR_MUTED, font=self._font(12), anchor="w").grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 6))
+        self.loc_progress_bar = ctk.CTkProgressBar(status_card, height=10, progress_color=COLOR_ACCENT, fg_color=COLOR_SURFACE_2)
+        self.loc_progress_bar.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 14))
+        self.loc_progress_bar.set(0)
         self._sync_localization_status_text()
         if not getattr(self, "loc_status_trace_bound", False):
             self.loc_summary_var.trace_add("write", self._sync_localization_status_text)
@@ -6373,6 +6390,8 @@ ID 缺失/多出：以 EN 优先作为基准，检查其他语言页是否缺少
         except Exception:
             pass
         self.loc_detected_headers = []
+        self.loc_multi_table_candidates_cache = []
+        self.loc_multi_table_cache_key = None
         self.loc_language_vars = {}
         try:
             self.loc_source_language_var.set("")
@@ -6385,6 +6404,12 @@ ID 缺失/多出：以 EN 优先作为基准，检查其他语言页是否缺少
         self.loc_all_issues = []
         self.loc_visible_issues = []
         self.loc_page_index = 1
+        self.loc_progress_var.set("等待开始")
+        if self.loc_progress_bar is not None:
+            try:
+                self.loc_progress_bar.set(0)
+            except Exception:
+                pass
         if hasattr(self, "loc_source_menu") and self.loc_source_menu is not None:
             try:
                 self.loc_source_menu.configure(values=["未识别"])
@@ -6410,6 +6435,14 @@ ID 缺失/多出：以 EN 优先作为基准，检查其他语言页是否缺少
             except Exception:
                 pass
 
+    def _localization_multi_table_cache_key(self, path=None):
+        return (
+            os.path.abspath(path or self.loc_file_path_var.get().strip()),
+            str(safe_int(self.loc_header_row_var.get(), 1)),
+            str(safe_int(self.loc_data_start_row_var.get(), 2)),
+            self.loc_key_column_var.get().strip(),
+        )
+
     def select_localization_file(self):
         path = filedialog.askopenfilename(title="选择翻译文件", filetypes=[("翻译文件", "*.xlsx *.csv"), ("所有文件", "*.*")])
         if not path:
@@ -6419,11 +6452,26 @@ ID 缺失/多出：以 EN 优先作为基准，检查其他语言页是否缺少
         self.loc_file_status_var.set(f"已选择：{get_file_info(path)}")
         self.loc_summary_var.set("已选择新文件，表格结构已重置为自动识别，请点击“识别结构/语言”重新识别")
 
+    def select_localization_folder(self):
+        path = filedialog.askdirectory(title="选择多文件字典文件夹")
+        if not path:
+            return
+        self.loc_file_path_var.set(path)
+        self._reset_localization_detection_state_for_new_file()
+        try:
+            count = len([name for name in os.listdir(path) if name.lower().startswith("dictionary_") and name.lower().endswith(".xlsx")])
+        except Exception:
+            count = 0
+        self.loc_structure_var.set("多文件字典模式" if count else "自动识别")
+        self.loc_file_status_var.set(f"已选择文件夹：{path} / dictionary 文件 {count} 个")
+        self.loc_summary_var.set("已选择字典文件夹，请点击“识别结构/语言”识别源语言和目标语言")
+
     def show_localization_multisheet_help(self):
         messagebox.showinfo(
-            "多 Sheet 语言页说明",
-            "多 Sheet 模式适用于每个语言一个 Sheet 的翻译表，例如 EN / DE / FR / JP。\n\n"
-            "每个语言 Sheet 需要包含 ID、源文本和翻译列。工具会统一转换为：ID、源文本、语言、翻译文本、Sheet、行号，再执行空翻译、中文残留、占位符、富文本等检查。"
+            "多 Sheet 模式说明",
+            "多 Sheet 翻译表：适用于一个 Excel 内有多个版本 Sheet，每个 Sheet 都是 Text ID + CN/EN/DE/FR... 多语言列。工具会批量检查所有符合结构的 Sheet，并在结果中保留 Sheet 名称。\n\n"
+            "多 Sheet 语言页：适用于每个语言一个 Sheet 的翻译表，例如 EN / DE / FR / JP。每个语言 Sheet 需要包含 ID、源文本和翻译列。\n\n"
+            "多文件字典模式：适用于 dictionary_ChineseSimplified.xlsx / dictionary_English.xlsx 这类一个语言一个文件的字典。工具会按 ID 对齐 Contents，忽略“所属模块”列检查，但会把模块写入报告。"
         )
 
     def detect_localization_columns(self):
@@ -6433,18 +6481,104 @@ ID 缺失/多出：以 EN 优先作为基准，检查其他语言页是否缺少
             return
         try:
             mode = normalize_localization_mode(self.loc_structure_var.get().strip() or "自动识别")
-            if mode == MULTI_SHEET_STRUCTURE:
+            precomputed_multi_table = None
+            if mode == MULTI_FILE_DICTIONARY_STRUCTURE:
+                structure = MULTI_FILE_DICTIONARY_STRUCTURE
+            elif mode == MULTI_TABLE_SHEETS_STRUCTURE:
+                structure = MULTI_TABLE_SHEETS_STRUCTURE
+            elif mode == MULTI_SHEET_STRUCTURE:
                 structure = MULTI_SHEET_STRUCTURE
             elif mode == SINGLE_SHEET_STRUCTURE:
                 structure = SINGLE_SHEET_STRUCTURE
             else:
-                structure = detect_localization_structure(path)
-                if structure == MULTI_SHEET_STRUCTURE:
+                dictionary_files, _dictionary_columns = detect_dictionary_language_files(path)
+                if len(dictionary_files) >= 2:
+                    structure = MULTI_FILE_DICTIONARY_STRUCTURE
+                else:
+                    structure = detect_localization_structure(path)
+                if structure == SINGLE_SHEET_STRUCTURE and not self.loc_sheet_var.get().strip():
+                    auto_options = LocalizationCheckOptions(
+                        header_row=safe_int(self.loc_header_row_var.get(), 1),
+                        data_start_row=safe_int(self.loc_data_start_row_var.get(), 2),
+                        key_column=self.loc_key_column_var.get().strip(),
+                        sheet_name="",
+                        table_structure="多 Sheet 翻译表",
+                    )
+                    precomputed_multi_table = detect_multi_table_sheet_columns(path, auto_options)
+                    if len(precomputed_multi_table[0]) >= 2:
+                        structure = MULTI_TABLE_SHEETS_STRUCTURE
+                if structure == MULTI_FILE_DICTIONARY_STRUCTURE:
+                    self.loc_structure_var.set("多文件字典模式")
+                elif structure == MULTI_TABLE_SHEETS_STRUCTURE:
+                    self.loc_structure_var.set("多 Sheet 翻译表")
+                elif structure == MULTI_SHEET_STRUCTURE:
                     self.loc_structure_var.set("多 Sheet 语言页")
                 elif structure == SINGLE_SHEET_STRUCTURE:
                     self.loc_structure_var.set("单 Sheet 多语言列")
                 else:
-                    raise FileReadError("未能自动识别多语言表结构，请手动选择「单 Sheet 多语言列」或「多 Sheet 语言页」")
+                    raise FileReadError("未能自动识别多语言表结构，请手动选择「单 Sheet 多语言列」「多 Sheet 翻译表」「多 Sheet 语言页」或「多文件字典模式」")
+
+            if structure == MULTI_FILE_DICTIONARY_STRUCTURE:
+                dictionary_files, columns = detect_dictionary_language_files(path)
+                if len(dictionary_files) < 2:
+                    raise FileReadError("未识别到多文件字典：请选择包含 dictionary_*.xlsx 的文件夹")
+                self.loc_detected_headers = [col.header for col in columns]
+                self._refresh_localization_language_checks(columns)
+                source = self.loc_source_language_var.get().strip()
+                if source not in self.loc_detected_headers:
+                    source = "CN" if "CN" in self.loc_detected_headers else ("EN" if "EN" in self.loc_detected_headers else self.loc_detected_headers[0])
+                self.loc_source_language_var.set(source)
+                if hasattr(self, "loc_source_menu"):
+                    self.loc_source_menu.configure(values=self.loc_detected_headers or ["未识别"])
+                preview_lines = [
+                    f"结构：多文件字典模式（识别到 {len(dictionary_files)} 份 dictionary_*.xlsx）",
+                    f"当前源语言：{source}（可在“源语言列”下拉框切换，例如 CN 或 EN）",
+                    "字段规则：B列 ID；C列 所属模块（仅报告定位，不参与文本检查）；D列 Contents；第5行开始为数据。",
+                    "",
+                    "语言文件：",
+                ]
+                for info in dictionary_files:
+                    marker = " ← 当前源语言" if info.code == source else ""
+                    preview_lines.append(f"- {info.code} / {info.name}：{info.file_name}{marker}")
+                if hasattr(self, "loc_structure_preview_box"):
+                    self._set_textbox_text(self.loc_structure_preview_box, "\n".join(preview_lines[:50]))
+                self.loc_file_status_var.set(f"识别成功：多文件字典模式 / 文件 {len(dictionary_files)} 个 / 语言 {', '.join(self.loc_detected_headers)}")
+                self.loc_summary_var.set("多文件字典识别完成，可在源语言下拉框选择 CN 或 EN 后开始检查")
+                return
+
+            if structure == MULTI_TABLE_SHEETS_STRUCTURE:
+                base_options = LocalizationCheckOptions(
+                    header_row=safe_int(self.loc_header_row_var.get(), 1),
+                    data_start_row=safe_int(self.loc_data_start_row_var.get(), 2),
+                    key_column=self.loc_key_column_var.get().strip(),
+                    sheet_name="",
+                    table_structure="多 Sheet 翻译表",
+                )
+                if precomputed_multi_table is not None:
+                    candidates, columns = precomputed_multi_table
+                else:
+                    candidates, columns = detect_multi_table_sheet_columns(path, base_options)
+                if not candidates:
+                    raise FileReadError("未识别到可批量检查的 Sheet：请确认每个版本 Sheet 都包含 Text ID、CN 原文和至少 2 个语言翻译列")
+                self.loc_multi_table_candidates_cache = list(candidates)
+                self.loc_multi_table_cache_key = self._localization_multi_table_cache_key(path)
+                preview_lines = [f"结构：多 Sheet 翻译表（将批量检查 {len(candidates)} 个 Sheet）", ""]
+                for sheet_name, score, reason in candidates:
+                    preview_lines.append(f"- {sheet_name}：评分 {score}；{reason}")
+                self.loc_detected_headers = [col.header for col in columns]
+                self._refresh_localization_language_checks(columns)
+                source = "CN" if "CN" in self.loc_detected_headers else auto_detect_source_language([col.header for col in columns], self.loc_detected_headers)
+                self.loc_source_language_var.set(source or "未识别")
+                if hasattr(self, "loc_source_menu"):
+                    values = self.loc_detected_headers or ["未识别"]
+                    self.loc_source_menu.configure(values=values)
+                preview_lines.insert(1, f"语言并集：{', '.join(self.loc_detected_headers) or '未识别'}")
+                preview_lines.insert(2, "提示：预览阶段只读取每个 Sheet 前 80 行；完整记录数会在开始检查后统计。")
+                if hasattr(self, "loc_structure_preview_box"):
+                    self._set_textbox_text(self.loc_structure_preview_box, "\n".join(preview_lines[:40]))
+                self.loc_file_status_var.set(f"识别成功：多 Sheet 翻译表 / Sheet {len(candidates)} 个 / 语言并集 {len(columns)} 个")
+                self.loc_summary_var.set("多 Sheet 翻译表识别完成，可开始批量检查")
+                return
 
             if structure == MULTI_SHEET_STRUCTURE:
                 enabled = []
@@ -6523,7 +6657,7 @@ ID 缺失/多出：以 EN 优先作为基准，检查其他语言页是否缺少
             ratio = float(self.loc_length_ratio_var.get().strip() or 0)
         except Exception:
             ratio = 0.0
-        return LocalizationCheckOptions(
+        options = LocalizationCheckOptions(
             header_row=safe_int(self.loc_header_row_var.get(), 1),
             data_start_row=safe_int(self.loc_data_start_row_var.get(), 2),
             key_column=self.loc_key_column_var.get().strip(),
@@ -6550,6 +6684,13 @@ ID 缺失/多出：以 EN 优先作为基准，检查其他语言页是否缺少
             check_source_consistency=self.loc_check_source_consistency_var.get(),
             check_numbers=self.loc_check_numbers_var.get(),
         )
+        if (
+            normalize_localization_mode(options.table_structure or "自动识别") == MULTI_TABLE_SHEETS_STRUCTURE
+            and self.loc_multi_table_candidates_cache
+            and self.loc_multi_table_cache_key == self._localization_multi_table_cache_key(self.loc_file_path_var.get().strip())
+        ):
+            options.precomputed_multi_table_sheets = list(self.loc_multi_table_candidates_cache)
+        return options
 
     def start_localization_check(self):
         if self.loc_is_working:
@@ -6562,6 +6703,7 @@ ID 缺失/多出：以 EN 优先作为基准，检查其他语言页是否缺少
         self.loc_stop_event.clear()
         self._refresh_localization_button()
         self._set_badge(True)
+        self._update_localization_progress({"message": "准备开始多语言检查…", "ratio": 0})
         self.loc_summary_var.set("正在检查多语言文本，请稍候...\n当前正在读取翻译文件并执行空翻译、残留中文、未完成占位文本、占位符、标签、特殊符号、数值一致、拼写疑似、术语一致性和译文重复等规则检查；数值顺序变化、JP 正常汉字、UI 方括号术语会按疑似/兼容规则降级。")
         self.after(50, self.update_idletasks)
         self.clear_localization_table()
@@ -6572,11 +6714,29 @@ ID 缺失/多出：以 EN 优先作为基准，检查其他语言页是否缺少
         if self.loc_is_working:
             self.loc_stop_event.set()
             self.loc_summary_var.set("正在请求停止检查，请稍候...")
+            self._update_localization_progress({"message": "正在请求停止检查，请稍候…"})
             self.after(50, self.update_idletasks)
+
+    def _update_localization_progress(self, payload):
+        try:
+            message = str(payload.get("message") or "")
+            if not message:
+                current = int(payload.get("current") or 0)
+                total = int(payload.get("total") or 0)
+                message = f"处理中：{current}/{total}" if total else "处理中…"
+            ratio = payload.get("ratio", None)
+            if ratio is not None and self.loc_progress_bar is not None and self.loc_progress_bar.winfo_exists():
+                self.loc_progress_bar.set(min(max(float(ratio), 0.0), 1.0))
+            self.loc_progress_var.set(message)
+        except Exception:
+            pass
 
     def _localization_worker(self, path, options):
         try:
-            issues, table, columns = check_localization_file(path, options, self.loc_stop_event)
+            def progress(payload):
+                self.after(0, lambda data=dict(payload): self._update_localization_progress(data))
+
+            issues, table, columns = check_localization_file(path, options, self.loc_stop_event, progress)
             self.after(0, lambda: self._on_localization_success(issues, table, columns))
         except FileReadError as exc:
             self.after(0, lambda msg=str(exc): self._on_localization_error(msg))
@@ -6587,6 +6747,7 @@ ID 缺失/多出：以 EN 优先作为基准，检查其他语言页是否缺少
         self.loc_is_working = False
         self._refresh_localization_button()
         self._set_badge(False)
+        self._update_localization_progress({"message": "检查完成，结果已刷新", "ratio": 1})
         self.loc_all_issues = issues
         self.loc_visible_issues = issues
         if columns and not self.loc_language_vars:
@@ -6600,14 +6761,17 @@ ID 缺失/多出：以 EN 优先作为基准，检查其他语言页是否缺少
         self.apply_localization_search_filter()
         counts = {}
         level_counts = {}
+        category_counts = {}
         for issue in issues:
             counts[issue.issue_type] = counts.get(issue.issue_type, 0) + 1
             level = getattr(issue, "issue_level", "普通问题")
             level_counts[level] = level_counts.get(level, 0) + 1
+            category = getattr(issue, "result_category", "明确问题")
+            category_counts[category] = category_counts.get(category, 0) + 1
         if not issues:
             self.loc_summary_var.set("检查完成：未发现问题")
         else:
-            level_top = " | ".join(f"{k} {v}" for k, v in level_counts.items())
+            level_top = " | ".join(f"{k} {v}" for k, v in category_counts.items())
             top = " | ".join(f"{k} {v}" for k, v in sorted(counts.items())[:8])
             self.loc_summary_var.set(f"检查完成：共 {len(issues)} 条问题 | {level_top} | {top}")
         self.after(50, self.update_idletasks)
@@ -6616,6 +6780,7 @@ ID 缺失/多出：以 EN 优先作为基准，检查其他语言页是否缺少
         self.loc_is_working = False
         self._refresh_localization_button()
         self._set_badge(False)
+        self._update_localization_progress({"message": "检查失败，请查看错误提示", "ratio": 0})
         self.loc_summary_var.set(f"检查失败：{message}")
         self.after(50, self.update_idletasks)
         messagebox.showerror("检查失败", message)
