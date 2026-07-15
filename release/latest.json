@@ -1,16 +1,18 @@
 {
-  "version": "2.4.34",
-  "build": 2434,
-  "published_at": "2026-07-07",
-  "installer_url": "https://github.com/linkjiyeon-gif/xiaolin-assistant-updates/releases/download/v2.4.34/XiaoLinAssistant_Setup_v2.4.34.exe",
-  "size": 35524658,
-  "sha256": "a20de5dabe61db172afa917550c25a6411b2b79afdf664773943a7b51cdf2f19",
+  "version": "2.4.36",
+  "build": 2436,
+  "published_at": "2026-07-15",
+  "installer_url": "https://github.com/linkjiyeon-gif/xiaolin-assistant-updates/releases/download/v2.4.36/XiaoLinAssistant_Setup_v2.4.36.exe",
+  "size": 35577244,
+  "sha256": "62c25e0b485ffd32a48d0bc78a3a84016d72c88c2e42771016a351cbbc6a584a",
   "release_notes": [
-    "修复多语言检查对双表头和重复 t 字段翻译表的识别失败问题",
-    "多语言检查支持自动选择真实数据 Sheet，并补充 HIN、UR、FA、MS 等语言列识别",
-    "按简体 CN 作为源语言比对其他语言，去除语义偏差和错译类主观检查",
-    "修复录屏完成后右侧快捷信息被完整文件路径撑宽的问题",
-    "修复多语言检查结果区提示文本在窄宽度下被截断的问题",
-    "软件中文显示名统一调整为测试助手"
+    "支持多文件语言字典和自由选择源语言，增强多 Sheet 翻译表及大文件识别",
+    "优化占位符、富文本标签、换行、特殊符号和源文本检查，减少误报与重复问题",
+    "优化等级、序数、范围、连字符、Excel 日期和本地化数值比较规则",
+    "整列未翻译改为语言覆盖状态汇总，个别空翻译继续逐行检查",
+    "报告按明确问题、源文本问题、需人工确认和语言覆盖范围分类，并自动筛选和冻结表头",
+    "修复主键 ID 带 .0 以及 #NAME? 被 Excel 识别为错误单元格的问题",
+    "ADB 设备列表和详情新增分辨率显示，支持 Physical 与 Override 分辨率",
+    "多设备按 Serial 独立查询分辨率，增加失败回退、缓存和异步刷新机制"
   ]
 }
