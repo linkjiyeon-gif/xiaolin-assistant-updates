@@ -1,18 +1,15 @@
 {
-  "version": "2.4.36",
-  "build": 2436,
-  "published_at": "2026-07-15",
-  "installer_url": "https://github.com/linkjiyeon-gif/xiaolin-assistant-updates/releases/download/v2.4.36/XiaoLinAssistant_Setup_v2.4.36.exe",
-  "size": 35577244,
-  "sha256": "62c25e0b485ffd32a48d0bc78a3a84016d72c88c2e42771016a351cbbc6a584a",
+  "version": "2.4.37",
+  "build": 2437,
+  "published_at": "2026-07-28",
+  "installer_url": "https://github.com/linkjiyeon-gif/xiaolin-assistant-updates/releases/download/v2.4.37/XiaoLinAssistant_Setup_v2.4.37.exe",
+  "size": 35585847,
+  "sha256": "3e671975b6aed7dc4efc6b7ccef8efd11ad03720f00db127db386e816fc90cc6",
   "release_notes": [
-    "支持多文件语言字典和自由选择源语言，增强多 Sheet 翻译表及大文件识别",
-    "优化占位符、富文本标签、换行、特殊符号和源文本检查，减少误报与重复问题",
-    "优化等级、序数、范围、连字符、Excel 日期和本地化数值比较规则",
-    "整列未翻译改为语言覆盖状态汇总，个别空翻译继续逐行检查",
-    "报告按明确问题、源文本问题、需人工确认和语言覆盖范围分类，并自动筛选和冻结表头",
-    "修复主键 ID 带 .0 以及 #NAME? 被 Excel 识别为错误单元格的问题",
-    "ADB 设备列表和详情新增分辨率显示，支持 Physical 与 Override 分辨率",
-    "多设备按 Serial 独立查询分辨率，增加失败回退、缓存和异步刷新机制"
+    "统一任务运行状态和缓存页面按钮刷新，修复任务已启动但按钮状态未变化的问题",
+    "弱网模拟增加真实启动确认、启动超时、失败回滚以及运行期间参数锁定",
+    "ADB 设备刷新改为快速扫描、并行详情补充和逐台渐进更新，降低界面等待感",
+    "单台 ADB 设备查询失败或超时不再影响其他设备，并防止旧刷新结果覆盖新状态",
+    "增加任务状态、弱网启动、ADB 渐进刷新及核心页面切换的自动化冒烟测试"
   ]
 }

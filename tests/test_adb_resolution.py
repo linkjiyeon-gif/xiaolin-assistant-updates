@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -139,6 +140,42 @@ class ADBResolutionTests(unittest.TestCase):
             third = self.tools.list_devices(refresh_resolutions=True)
             self.assertEqual(third["devices"][1]["resolution"], "720 × 1600")
             self.assertEqual(wm_calls.count("SERIAL-B"), 2)
+
+    def test_staged_detail_enrichment_reports_progress_and_isolates_devices(self):
+        quick = {
+            "result": command_result(["devices", "-l"]),
+            "devices": [
+                {"serial": "SERIAL-A", "status": "device", "model": "A", "resolution": "未知"},
+                {"serial": "SERIAL-B", "status": "device", "model": "B", "resolution": "未知"},
+                {"serial": "OFFLINE", "status": "offline", "resolution": "未知"},
+            ],
+            "selected_serial": "",
+            "ready_count": 2,
+        }
+        worker_threads = []
+        progress = []
+
+        def fill(device, refresh_resolution=False):
+            worker_threads.append(threading.current_thread().name)
+            if device.serial == "SERIAL-A":
+                device.resolution = "1080 × 2400"
+            else:
+                device.resolution = "720 × 1600"
+
+        with patch.object(self.tools, "_fill_device_details", side_effect=fill):
+            detailed = self.tools.enrich_device_data(
+                quick,
+                refresh_resolutions=True,
+                progress_callback=lambda item, done, total: progress.append((item["serial"], done, total)),
+            )
+
+        by_serial = {item["serial"]: item for item in detailed["devices"]}
+        self.assertEqual("1080 × 2400", by_serial["SERIAL-A"]["resolution"])
+        self.assertEqual("720 × 1600", by_serial["SERIAL-B"]["resolution"])
+        self.assertEqual("未知", by_serial["OFFLINE"]["resolution"])
+        self.assertEqual({1, 2}, {done for _, done, _ in progress})
+        self.assertTrue(all(total == 2 for _, _, total in progress))
+        self.assertTrue(all(name.startswith("adb-detail") for name in worker_threads))
 
 
 if __name__ == "__main__":

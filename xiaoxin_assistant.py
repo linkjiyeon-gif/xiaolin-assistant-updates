@@ -25,6 +25,7 @@ from app.comparer import CompareOptions, ContentComparer, DiffItem
 from app.constants import APP_NAME, APP_SUBTITLE, APP_VERSION, COMPARE_MODES, SUPPORTED_EXTENSIONS
 from app.excel_exporter import export_diffs_to_excel, export_value_compare_diffs_to_excel
 from app.adb_tools import ADBTools
+from app.task_state import RuntimeTaskState, TaskPhase
 from app.apk_info import analyze_apk, format_apk_info
 from app.file_readers import FileReadError, get_file_info, read_file
 from app.normalizer import NormalizeOptions, clean_ignore_fields
@@ -287,9 +288,14 @@ class ClickerWorker:
 
 # ---------------- Network Delay / Loss ----------------
 class NetworkWorker:
-    def __init__(self, log_callback):
+    def __init__(self, log_callback, state_callback=None):
         self.log_callback = log_callback
+        self.state_callback = state_callback
         self.running = threading.Event()
+        self.startup_event = threading.Event()
+        self.startup_error = ""
+        self.startup_timeout_seconds = 8
+        self._start_generation = 0
         self.capture_thread = None
         self.dispatch_thread = None
         self.handle = None
@@ -306,6 +312,15 @@ class NetworkWorker:
         self.captured_count = 0
         self.dropped_count = 0
         self.sent_count = 0
+
+    def _emit_state(self, phase, message=""):
+        callback = self.state_callback
+        if callback is None:
+            return
+        try:
+            callback(phase, message)
+        except Exception:
+            pass
 
     def start(self, delay_ms: int, loss_percent: int, filter_text: str):
         if self.running.is_set():
@@ -327,14 +342,40 @@ class NetworkWorker:
         self.dropped_count = 0
         self.sent_count = 0
         self.packet_seq = itertools.count()
+        self.startup_error = ""
+        self.startup_event.clear()
+        self._start_generation += 1
+        generation = self._start_generation
 
+        self._emit_state(TaskPhase.STARTING, "正在初始化 WinDivert")
         self.running.set()
         self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self.dispatch_thread = threading.Thread(target=self._dispatch_loop, daemon=True)
         self.capture_thread.start()
         self.dispatch_thread.start()
+        threading.Thread(target=self._watch_startup, args=(generation,), daemon=True).start()
+
+    def _watch_startup(self, generation):
+        if self.startup_event.wait(timeout=self.startup_timeout_seconds):
+            return
+        if generation != self._start_generation or not self.running.is_set():
+            return
+        self.startup_error = f"WinDivert 启动确认超时（{self.startup_timeout_seconds} 秒）"
+        self.running.clear()
+        try:
+            if self.handle:
+                self.handle.close()
+        except Exception:
+            pass
+        with self.cond:
+            self.cond.notify_all()
+        self._emit_state(TaskPhase.FAILED, self.startup_error)
+        self.log_callback(self.startup_error)
 
     def stop(self):
+        was_running = self.running.is_set()
+        if was_running:
+            self._emit_state(TaskPhase.STOPPING, "正在停止弱网模拟")
         self.running.clear()
         with self.cond:
             self.heap.clear()
@@ -346,14 +387,22 @@ class NetworkWorker:
         except Exception:
             pass
         self.handle = None
+        self.startup_event.set()
+        if was_running:
+            self._emit_state(TaskPhase.IDLE, "弱网模拟已停止")
 
     def _capture_loop(self):
+        failed = False
         try:
             import pydivert
 
             self.log_callback(f"WinDivert 过滤规则：{self.filter_text}")
             self.handle = pydivert.WinDivert(self.filter_text)
             self.handle.open()
+            if not self.running.is_set():
+                return
+            self.startup_event.set()
+            self._emit_state(TaskPhase.RUNNING, "弱网模拟运行中")
             self.log_callback("已开始拦截本机网络包")
 
             while self.running.is_set():
@@ -377,12 +426,19 @@ class NetworkWorker:
                     self.cond.notify()
 
         except Exception as exc:
+            failed = True
+            self.startup_error = str(exc)
             self.running.clear()
+            self.startup_event.set()
+            self._emit_state(TaskPhase.FAILED, self.startup_error)
             self.log_callback(f"启动失败：{exc}")
         finally:
             self.running.clear()
+            self.startup_event.set()
             with self.cond:
                 self.cond.notify_all()
+            if not failed and not self.startup_error:
+                self._emit_state(TaskPhase.IDLE, "弱网模拟已停止")
 
     def _dispatch_loop(self):
         while self.running.is_set():
@@ -801,8 +857,21 @@ class XiaoXinAssistant(ctk.CTk):
         self.tray_error = ""
         self._tray_hide_tip_shown = False
 
+        self.task_states = {
+            name: RuntimeTaskState(name)
+            for name in (
+                "clicker",
+                "network",
+                "adb_log",
+                "adb_tools",
+                "ios_log",
+                "compare",
+                "localization",
+                "config_validator",
+            )
+        }
         self.clicker = ClickerWorker()
-        self.network = NetworkWorker(self._network_log)
+        self.network = NetworkWorker(self._network_log, self._on_network_state)
         self.log_monitor = LogMonitor(DEFAULT_KEYWORDS, context_lines=20)
         self.crash_stream_detector = CrashStreamDetector(context_lines=50)
         self.crash_file_analyzer = CrashAnalyzer(context_lines=60)
@@ -863,6 +932,7 @@ class XiaoXinAssistant(ctk.CTk):
         self.adb_tools_foreground_var = tk.StringVar(value="未识别")
         self.adb_recording_status_var = tk.StringVar(value="未录屏")
         self.adb_tools_busy = threading.Event()
+        self._adb_refresh_generation = 0
         self.adb_recording_session = None
         self.apk_path_var = tk.StringVar(value="")
         self.apk_status_var = tk.StringVar(value="未选择 APK")
@@ -1861,6 +1931,7 @@ class XiaoXinAssistant(ctk.CTk):
             self._set_badge(self.network.running.is_set(), admin_required=True)
             if needs_build:
                 self._build_network_page()
+            self._refresh_network_button()
         elif key == "adb_log":
             self.page_title.configure(text="日志抓取")
             self.page_subtitle.configure(text="连接安卓设备后抓取指定包名的 ADB 日志")
@@ -1909,6 +1980,8 @@ class XiaoXinAssistant(ctk.CTk):
             self._set_badge(False)
             if needs_build:
                 self._build_time_tools_page()
+        self._sync_legacy_task_states()
+        self._refresh_current_task_ui()
 
     def _show_page_badge(self):
         if not hasattr(self, "page_badge"):
@@ -1939,6 +2012,84 @@ class XiaoXinAssistant(ctk.CTk):
             return
 
         self._hide_page_badge()
+
+    def _task_snapshot(self, name):
+        state = getattr(self, "task_states", {}).get(name)
+        return state.snapshot() if state is not None else None
+
+    def _set_task_phase(self, name, phase, message=""):
+        state = getattr(self, "task_states", {}).get(name)
+        if state is None:
+            return None
+        snapshot = state.set(phase, message)
+        try:
+            self.after(0, self._refresh_current_task_ui)
+        except Exception:
+            pass
+        return snapshot
+
+    def _on_network_state(self, phase, message=""):
+        self._set_task_phase("network", phase, message)
+
+    def _sync_legacy_task_states(self):
+        """Mirror legacy flags into one UI-facing task-state registry."""
+        mappings = {
+            "clicker": self.clicker.running.is_set(),
+            "adb_log": self.adb_log.running.is_set(),
+            "ios_log": self.ios_log_running.is_set(),
+            "compare": bool(self.compare_is_working),
+            "localization": bool(self.loc_is_working),
+            "config_validator": bool(self.cfg_is_working),
+        }
+        for name, running in mappings.items():
+            self.task_states[name].set(TaskPhase.RUNNING if running else TaskPhase.IDLE)
+
+        adb_running = self.adb_tools_busy.is_set() or self.adb_tools.is_recording()
+        adb_snapshot = self.task_states["adb_tools"].snapshot()
+        if adb_snapshot.phase not in (TaskPhase.STARTING, TaskPhase.STOPPING, TaskPhase.FAILED):
+            self.task_states["adb_tools"].set(TaskPhase.RUNNING if adb_running else TaskPhase.IDLE)
+
+    def _set_task_badge(self, snapshot, admin_required=False):
+        if snapshot is None:
+            self._set_badge(False, admin_required=admin_required)
+            return
+        labels = {
+            TaskPhase.STARTING: ("●  启动中", COLOR_ACCENT),
+            TaskPhase.RUNNING: ("●  运行中", COLOR_DANGER),
+            TaskPhase.STOPPING: ("●  停止中", COLOR_ACCENT),
+            TaskPhase.FAILED: ("●  启动失败", COLOR_DANGER),
+        }
+        label = labels.get(snapshot.phase)
+        if label:
+            self._show_page_badge()
+            self.page_badge.configure(text=label[0], fg_color=COLOR_SURFACE_2, text_color=label[1])
+        else:
+            self._set_badge(False, admin_required=admin_required)
+
+    def _refresh_current_task_ui(self):
+        page = getattr(self, "current_page", "home")
+        page_tasks = {
+            "clicker": ("clicker", self._refresh_clicker_button, False),
+            "network": ("network", self._refresh_network_button, True),
+            "adb_log": ("adb_log", self._refresh_adb_button, False),
+            "log_analysis": ("adb_log", self._refresh_adb_button, False),
+            "adb_tools": ("adb_tools", self._refresh_adb_tools_buttons, False),
+            "ios_log": ("ios_log", self._refresh_ios_log_button, False),
+            "compare": ("compare", self._refresh_compare_button, False),
+            "localization": ("localization", self._refresh_localization_button, False),
+            "config_validator": ("config_validator", self._refresh_config_validator_button, False),
+        }
+        item = page_tasks.get(page)
+        if item is None:
+            if page == "home":
+                self._set_badge(False)
+            return
+        task_name, refresh, admin_required = item
+        self._set_task_badge(self._task_snapshot(task_name), admin_required=admin_required)
+        try:
+            refresh()
+        except Exception:
+            pass
 
     def _card(self, parent):
         card = ctk.CTkFrame(parent, fg_color=COLOR_SURFACE, corner_radius=16, border_width=1, border_color=COLOR_BORDER)
@@ -2530,6 +2681,23 @@ class XiaoXinAssistant(ctk.CTk):
         if hasattr(self, "click_tip_label"):
             self.click_tip_label.configure(text=self._click_tip_text())
 
+    def _refresh_clicker_button(self):
+        button = getattr(self, "click_start_button", None)
+        if button is None:
+            return
+        try:
+            if not button.winfo_exists():
+                return
+            running = self.clicker.running.is_set()
+            button.configure(
+                text="■  停止连点" if running else "▶  开始连点",
+                fg_color=COLOR_DANGER if running else COLOR_ACCENT,
+                hover_color=COLOR_DANGER_HOVER if running else COLOR_ACCENT_HOVER,
+            )
+            self._refresh_click_tip()
+        except Exception:
+            pass
+
     def _on_click_interval_changed(self, value):
         if value == "自定义":
             dialog = ctk.CTkInputDialog(title="自定义点击间隔", text="请输入点击间隔，单位毫秒，最小 10")
@@ -2564,11 +2732,15 @@ class XiaoXinAssistant(ctk.CTk):
             except Exception as exc:
                 messagebox.showerror("启动失败", str(exc))
                 return
-        if self.current_page == "clicker":
-            self.show_page("clicker")
+        self._set_task_phase(
+            "clicker",
+            TaskPhase.RUNNING if self.clicker.running.is_set() else TaskPhase.IDLE,
+        )
+        self._refresh_clicker_button()
 
     # ---------- Network page ----------
     def _build_network_page(self):
+        self.network_parameter_widgets = []
         wrap = ctk.CTkFrame(self.content, fg_color=COLOR_BG)
         wrap.grid(row=0, column=0, sticky="nsew")
         wrap.grid_columnconfigure(0, weight=1)
@@ -2577,15 +2749,19 @@ class XiaoXinAssistant(ctk.CTk):
         card = self._card(wrap)
         card.grid_columnconfigure((0, 1), weight=1, uniform="network_settings")
 
-        self._small_entry(card, 0, 0, "目标 IP", self.target_ip_var, "留空 = 全部，例如 8.8.8.8")
-        self._small_entry(card, 0, 1, "高级规则", self.advanced_filter_var, "可选；填写后覆盖其他规则")
+        self.network_parameter_widgets.append(
+            self._small_entry(card, 0, 0, "目标 IP", self.target_ip_var, "留空 = 全部，例如 8.8.8.8")
+        )
+        self.network_parameter_widgets.append(
+            self._small_entry(card, 0, 1, "高级规则", self.advanced_filter_var, "可选；填写后覆盖其他规则")
+        )
 
         def compact_option(row, col, label, variable, values):
             box = ctk.CTkFrame(card, fg_color="transparent")
             box.grid(row=row, column=col, sticky="ew", padx=(0, 12), pady=5)
             box.grid_columnconfigure(0, weight=1)
             ctk.CTkLabel(box, text=label, text_color=COLOR_MUTED, font=self._font(12), anchor="w").grid(row=0, column=0, sticky="ew")
-            ctk.CTkOptionMenu(
+            menu = ctk.CTkOptionMenu(
                 box,
                 variable=variable,
                 values=values,
@@ -2596,17 +2772,21 @@ class XiaoXinAssistant(ctk.CTk):
                 button_hover_color=COLOR_HOVER,
                 text_color=COLOR_TEXT,
                 font=self._font(12),
-            ).grid(row=1, column=0, sticky="ew", pady=(3, 0))
+            )
+            menu.grid(row=1, column=0, sticky="ew", pady=(3, 0))
+            return menu
 
-        compact_option(1, 0, "协议类型", self.protocol_var, ["全部", "TCP", "UDP", "ICMP"])
-        compact_option(1, 1, "方向", self.direction_var, ["全部", "出站", "入站"])
-        self._small_entry(card, 2, 0, "延迟时间（毫秒）", self.delay_var, "例如 300")
-        self._small_entry(card, 2, 1, "丢包概率（0-100）", self.loss_var, "例如 5")
+        self.network_parameter_widgets.append(compact_option(1, 0, "协议类型", self.protocol_var, ["全部", "TCP", "UDP", "ICMP"]))
+        self.network_parameter_widgets.append(compact_option(1, 1, "方向", self.direction_var, ["全部", "出站", "入站"]))
+        self.network_parameter_widgets.append(self._small_entry(card, 2, 0, "延迟时间（毫秒）", self.delay_var, "例如 300"))
+        self.network_parameter_widgets.append(self._small_entry(card, 2, 1, "丢包概率（0-100）", self.loss_var, "例如 5"))
 
         preset = ctk.CTkFrame(wrap, fg_color=COLOR_BG)
         preset.pack(fill="x", pady=(0, 16))
         for text, delay, loss in [("轻微延迟", "100", "0"), ("弱网测试", "300", "2"), ("明显卡顿", "800", "5"), ("高丢包", "100", "15")]:
-            ctk.CTkButton(preset, text=text, width=112, height=34, corner_radius=12, fg_color=COLOR_SURFACE, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13, "bold"), command=lambda d=delay, l=loss: self._apply_network_preset(d, l)).pack(side="left", padx=(0, 10))
+            preset_button = ctk.CTkButton(preset, text=text, width=112, height=34, corner_radius=12, fg_color=COLOR_SURFACE, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13, "bold"), command=lambda d=delay, l=loss: self._apply_network_preset(d, l))
+            preset_button.pack(side="left", padx=(0, 10))
+            self.network_parameter_widgets.append(preset_button)
 
         action = ctk.CTkFrame(wrap, fg_color=COLOR_SURFACE, corner_radius=16, border_width=1, border_color=COLOR_BORDER)
         action.pack(fill="both", expand=True)
@@ -2622,6 +2802,7 @@ class XiaoXinAssistant(ctk.CTk):
         self.network_log_box.grid(row=2, column=0, sticky="nsew", padx=24, pady=(0, 24))
         self.network_log_box.insert("end", "提示：弱网功能需要管理员权限；目标 IP 留空会影响全部匹配流量。\n")
         self.network_log_box.configure(state="disabled")
+        self._refresh_network_button()
 
     def _apply_network_preset(self, delay, loss):
         if self.network.running.is_set():
@@ -2629,6 +2810,44 @@ class XiaoXinAssistant(ctk.CTk):
             return
         self.delay_var.set(delay)
         self.loss_var.set(loss)
+
+    def _refresh_network_button(self):
+        button = getattr(self, "network_button", None)
+        if button is None:
+            return
+        try:
+            if not button.winfo_exists():
+                return
+            snapshot = self._task_snapshot("network") if hasattr(self, "_task_snapshot") else None
+            phase = snapshot.phase if snapshot is not None else (
+                TaskPhase.RUNNING if self.network.running.is_set() else TaskPhase.IDLE
+            )
+            if phase == TaskPhase.STARTING:
+                text, color, hover, state = "…  正在启动", COLOR_ACCENT, COLOR_ACCENT_HOVER, "disabled"
+            elif phase == TaskPhase.STOPPING:
+                text, color, hover, state = "…  正在停止", COLOR_DANGER, COLOR_DANGER_HOVER, "disabled"
+            elif phase == TaskPhase.RUNNING:
+                text, color, hover, state = "■  停止模拟", COLOR_DANGER, COLOR_DANGER_HOVER, "normal"
+            else:
+                text, color, hover, state = "▶  开始模拟", COLOR_ACCENT, COLOR_ACCENT_HOVER, "normal"
+            button.configure(
+                text=text,
+                fg_color=color,
+                hover_color=hover,
+                state=state,
+            )
+            self._set_network_controls_locked(phase in (TaskPhase.STARTING, TaskPhase.RUNNING, TaskPhase.STOPPING))
+        except Exception:
+            pass
+
+    def _set_network_controls_locked(self, locked):
+        state = "disabled" if locked else "normal"
+        for widget in getattr(self, "network_parameter_widgets", []):
+            try:
+                if widget is not None and widget.winfo_exists():
+                    widget.configure(state=state)
+            except Exception:
+                pass
 
     def _build_filter(self):
         advanced = self.advanced_filter_var.get().strip()
@@ -2674,19 +2893,26 @@ class XiaoXinAssistant(ctk.CTk):
         return delay, loss, self._build_filter()
 
     def toggle_network(self):
-        if self.network.running.is_set():
+        snapshot = self._task_snapshot("network")
+        phase = snapshot.phase if snapshot is not None else (
+            TaskPhase.RUNNING if self.network.running.is_set() else TaskPhase.IDLE
+        )
+        if phase in (TaskPhase.STARTING, TaskPhase.STOPPING):
+            return
+        if phase == TaskPhase.RUNNING or self.network.running.is_set():
+            self._set_task_phase("network", TaskPhase.STOPPING, "正在停止弱网模拟")
             self.network.stop()
         else:
             try:
                 delay, loss, filter_text = self._parse_network_config()
+                self._set_task_phase("network", TaskPhase.STARTING, "正在初始化 WinDivert")
                 self.network.start(delay, loss, filter_text)
-                self._network_log(f"已启动：延迟 {delay}ms，丢包 {loss}%")
+                self._network_log(f"正在启动：延迟 {delay}ms，丢包 {loss}%")
                 self._network_log(f"当前规则：{filter_text}")
             except Exception as exc:
+                self._set_task_phase("network", TaskPhase.FAILED, str(exc))
                 messagebox.showerror("启动失败", str(exc))
-                return
-        if self.current_page == "network":
-            self.show_page("network")
+        self._refresh_network_button()
 
     def _network_log(self, text):
         def write():
@@ -3194,12 +3420,12 @@ class XiaoXinAssistant(ctk.CTk):
 
         self.adb_checking.set()
         self._adb_log("正在检测 ADB 设备")
+        generation = self._begin_adb_refresh()
 
         def worker():
             try:
-                data = self.adb_tools.list_devices(refresh_resolutions=True)
+                data = self._scan_adb_devices_staged(generation, refresh_resolutions=True)
                 text = self.adb_tools.format_devices_text(data)
-                self.after(0, lambda d=data: self._update_adb_device_choices(d))
                 self._adb_log("ADB 设备检测结果：")
                 for line in text.splitlines() or ["无输出"]:
                     self._adb_log(line)
@@ -3207,6 +3433,77 @@ class XiaoXinAssistant(ctk.CTk):
                 self.adb_checking.clear()
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _begin_adb_refresh(self):
+        self._adb_refresh_generation += 1
+        return self._adb_refresh_generation
+
+    def _apply_adb_scan_snapshot(self, data, generation, hint=""):
+        if generation != self._adb_refresh_generation:
+            return
+        self._update_adb_device_choices(data)
+        text = self.adb_tools.format_devices_text(data)
+        self.adb_tools_devices_var.set(text)
+        box = getattr(self, "adb_tools_devices_box", None)
+        if box is not None and box.winfo_exists():
+            self._set_textbox_text(box, text)
+        if hint:
+            self.adb_device_hint_var.set(hint)
+
+    def _apply_adb_detail_progress(self, item, completed, total, generation):
+        if generation != self._adb_refresh_generation:
+            return
+        current = dict(self._adb_last_device_data or {})
+        devices = [dict(device) for device in current.get("devices", []) or []]
+        serial = item.get("serial")
+        for index, device in enumerate(devices):
+            if device.get("serial") == serial:
+                devices[index] = dict(item)
+                break
+        current["devices"] = devices
+        self._apply_adb_scan_snapshot(
+            current,
+            generation,
+            f"已识别 {len(devices)} 台设备，正在读取详情 {completed}/{total}…",
+        )
+
+    def _scan_adb_devices_staged(self, generation, refresh_resolutions=True):
+        quick = self.adb_tools.list_devices(detailed=False)
+        ready_count = int(quick.get("ready_count") or 0)
+        self.after(
+            0,
+            lambda data=quick, count=ready_count: self._apply_adb_scan_snapshot(
+                data,
+                generation,
+                f"已完成快速扫描，正在读取在线设备详情 0/{count}…",
+            ),
+        )
+
+        def progress(item, completed, total):
+            self.after(
+                0,
+                lambda current=item, done=completed, count=total: self._apply_adb_detail_progress(
+                    current,
+                    done,
+                    count,
+                    generation,
+                ),
+            )
+
+        detailed = self.adb_tools.enrich_device_data(
+            quick,
+            refresh_resolutions=refresh_resolutions,
+            progress_callback=progress,
+        )
+        self.after(
+            0,
+            lambda data=detailed: self._apply_adb_scan_snapshot(
+                data,
+                generation,
+                f"设备详情刷新完成，共 {len(data.get('devices', []) or [])} 台。",
+            ),
+        )
+        return detailed
 
     def open_adb_log_dir(self):
         try:
@@ -4052,23 +4349,31 @@ class XiaoXinAssistant(ctk.CTk):
             self._adb_tools_log("已有 ADB 操作正在执行，请稍后再试")
             return
         self.adb_tools_busy.set()
+        self._set_task_phase("adb_tools", TaskPhase.STARTING, title)
         self._adb_tools_log(f"开始：{title}")
         self._refresh_adb_tools_buttons()
 
         def run():
             try:
+                self._set_task_phase("adb_tools", TaskPhase.RUNNING, title)
                 result = worker()
                 def ok():
                     if on_success:
                         on_success(result)
+                    self._set_task_phase("adb_tools", TaskPhase.SUCCEEDED, f"{title}已完成")
                     self._adb_tools_log(f"完成：{title}")
             except Exception as exc:
                 def ok(exc=exc):
+                    self._set_task_phase("adb_tools", TaskPhase.FAILED, str(exc))
                     self._adb_tools_log(f"失败：{title}｜{exc}")
                     messagebox.showerror("操作失败", str(exc))
             finally:
                 def done():
                     self.adb_tools_busy.clear()
+                    if self.adb_tools.is_recording():
+                        self._set_task_phase("adb_tools", TaskPhase.RUNNING, "录屏中")
+                    elif self._task_snapshot("adb_tools").phase != TaskPhase.FAILED:
+                        self._set_task_phase("adb_tools", TaskPhase.IDLE)
                     self._refresh_adb_tools_buttons()
                 try:
                     self.after(0, ok)
@@ -4092,7 +4397,9 @@ class XiaoXinAssistant(ctk.CTk):
         def worker():
             kill = self.adb_tools.run(["kill-server"], timeout=8)
             start = self.adb_tools.run(["start-server"], timeout=8)
-            return kill, start, self.adb_tools.list_devices(refresh_resolutions=True)
+            generation = self._begin_adb_refresh()
+            data = self._scan_adb_devices_staged(generation, refresh_resolutions=True)
+            return kill, start, data
         def success(result):
             kill, start, data = result
             self._adb_tools_log("ADB 服务已重启" if start.ok else f"ADB 服务重启可能失败：{start.output}")
@@ -4105,7 +4412,8 @@ class XiaoXinAssistant(ctk.CTk):
 
     def adb_tools_check_devices(self):
         def worker():
-            return self.adb_tools.list_devices(refresh_resolutions=True)
+            generation = self._begin_adb_refresh()
+            return self._scan_adb_devices_staged(generation, refresh_resolutions=True)
         def success(data):
             self._update_adb_device_choices(data)
             text = self.adb_tools.format_devices_text(data)
@@ -5481,7 +5789,9 @@ class XiaoXinAssistant(ctk.CTk):
         box.grid(row=row, column=col, sticky="ew", padx=(0, 12), pady=5)
         box.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(box, text=label, text_color=COLOR_MUTED, font=self._font(12), anchor="w").grid(row=0, column=0, sticky="ew")
-        ctk.CTkEntry(box, textvariable=variable, placeholder_text=placeholder, height=34, corner_radius=9, fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(12)).grid(row=1, column=0, sticky="ew", pady=(3, 0))
+        entry = ctk.CTkEntry(box, textvariable=variable, placeholder_text=placeholder, height=34, corner_radius=9, fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(12))
+        entry.grid(row=1, column=0, sticky="ew", pady=(3, 0))
+        return entry
 
     def _toggle_translation_advanced(self):
         if self.tr_advanced_frame is None:
@@ -8147,30 +8457,8 @@ ID 缺失/多出：以 EN 优先作为基准，检查其他语言页是否缺少
         if self.is_exiting:
             return
         self.network_stats_var.set(f"捕获 {self.network.captured_count} ｜ 丢弃 {self.network.dropped_count} ｜ 放行 {self.network.sent_count}")
-        if self.current_page == "clicker":
-            self._set_badge(self.clicker.running.is_set())
-        elif self.current_page == "network":
-            self._set_badge(self.network.running.is_set(), admin_required=True)
-        elif self.current_page == "adb_log":
-            self._set_badge(self.adb_log.running.is_set())
-            self._refresh_adb_button()
-        elif self.current_page == "adb_tools":
-            self._set_badge(self.adb_tools.is_recording())
-            self._refresh_adb_tools_buttons()
-        elif self.current_page == "ios_log":
-            self._set_badge(self.ios_log_running.is_set())
-            self._refresh_ios_log_button()
-        elif self.current_page == "compare":
-            self._set_badge(self.compare_is_working)
-            self._refresh_compare_button()
-        elif self.current_page == "localization":
-            self._set_badge(self.loc_is_working)
-            self._refresh_localization_button()
-        elif self.current_page == "config_validator":
-            self._set_badge(self.cfg_is_working)
-            self._refresh_config_validator_button()
-        elif self.current_page == "home":
-            self._set_badge(False)
+        self._sync_legacy_task_states()
+        self._refresh_current_task_ui()
 
         self.after(500, self._tick_stats)
 

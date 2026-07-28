@@ -6,8 +6,9 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 
 DEFAULT_TIMEOUT = 12
@@ -312,24 +313,90 @@ class ADBTools:
         result = self._normalize_adb_error(result)
         devices = self._parse_devices_output(result.stdout)
         self._prune_resolution_cache(item.serial for item in devices)
-        if detailed:
-            for device in devices:
-                if device.status == "device":
-                    self._fill_device_details(device, refresh_resolution=refresh_resolutions)
-                else:
-                    device.resolution = "未知"
         self._last_devices = devices
         ready = [item for item in devices if item.status == "device"]
         if self.selected_serial and not any(item.serial == self.selected_serial and item.status == "device" for item in devices):
             self.selected_serial = ""
         if not self.selected_serial and len(ready) == 1:
             self.selected_serial = ready[0].serial
-        return {
+        data = {
             "result": result,
             "devices": [device.to_dict() for device in devices],
             "selected_serial": self.selected_serial,
             "ready_count": len(ready),
         }
+        if detailed:
+            return self.enrich_device_data(
+                data,
+                refresh_resolutions=refresh_resolutions,
+            )
+        return data
+
+    @staticmethod
+    def _device_from_mapping(item: Dict[str, object]) -> ADBDeviceInfo:
+        device = ADBDeviceInfo(
+            serial=str(item.get("serial") or ""),
+            status=str(item.get("status") or ""),
+        )
+        for name in ADBDeviceInfo.__dataclass_fields__:
+            if name in ("serial", "status") or name not in item:
+                continue
+            setattr(device, name, item[name])
+        return device
+
+    def enrich_device_data(
+        self,
+        data: Dict[str, object],
+        refresh_resolutions: bool = False,
+        progress_callback: Optional[Callable[[Dict[str, object], int, int], None]] = None,
+        max_workers: int = 4,
+    ) -> Dict[str, object]:
+        """Fill online-device details in parallel and report progressive results.
+
+        The initial ``list_devices(detailed=False)`` result remains useful even
+        when one device times out. Every adb detail command is still bound to
+        that device's own serial.
+        """
+
+        source_items = list(data.get("devices", []) or [])
+        devices = [self._device_from_mapping(dict(item)) for item in source_items]
+        online_indices = [index for index, device in enumerate(devices) if device.status == "device"]
+        total = len(online_indices)
+        completed = 0
+
+        for device in devices:
+            if device.status != "device":
+                device.resolution = "未知"
+
+        def fill(index: int):
+            device = devices[index]
+            try:
+                self._fill_device_details(device, refresh_resolution=refresh_resolutions)
+            except Exception:
+                # A detail failure must never remove the device from the scan.
+                device.resolution = device.resolution or "获取失败"
+            return index, device
+
+        if online_indices:
+            worker_count = max(1, min(int(max_workers or 1), total))
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="adb-detail") as executor:
+                futures = [executor.submit(fill, index) for index in online_indices]
+                for future in as_completed(futures):
+                    index, device = future.result()
+                    devices[index] = device
+                    completed += 1
+                    if progress_callback is not None:
+                        try:
+                            progress_callback(device.to_dict(), completed, total)
+                        except Exception:
+                            pass
+
+        self._last_devices = devices
+        enriched = dict(data)
+        enriched["devices"] = [device.to_dict() for device in devices]
+        enriched["ready_count"] = total
+        enriched["selected_serial"] = self.selected_serial
+        return enriched
 
     def _fill_device_details(self, device: ADBDeviceInfo, refresh_resolution: bool = False) -> None:
         def prop(name: str) -> str:
