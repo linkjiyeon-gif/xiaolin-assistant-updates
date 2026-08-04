@@ -1,15 +1,16 @@
 {
-  "version": "2.4.37",
-  "build": 2437,
-  "published_at": "2026-07-28",
-  "installer_url": "https://github.com/linkjiyeon-gif/xiaolin-assistant-updates/releases/download/v2.4.37/XiaoLinAssistant_Setup_v2.4.37.exe",
-  "size": 35585847,
-  "sha256": "3e671975b6aed7dc4efc6b7ccef8efd11ad03720f00db127db386e816fc90cc6",
+  "version": "2.4.38",
+  "build": 2438,
+  "published_at": "2026-08-04",
+  "installer_url": "https://github.com/linkjiyeon-gif/xiaolin-assistant-updates/releases/download/v2.4.38/XiaoLinAssistant_Setup_v2.4.38.exe",
+  "size": 35603291,
+  "sha256": "1237c0bf637e8dbc33b45033333791ea69170a5b6775f872ce96c55169955cdd",
   "release_notes": [
-    "统一任务运行状态和缓存页面按钮刷新，修复任务已启动但按钮状态未变化的问题",
-    "弱网模拟增加真实启动确认、启动超时、失败回滚以及运行期间参数锁定",
-    "ADB 设备刷新改为快速扫描、并行详情补充和逐台渐进更新，降低界面等待感",
-    "单台 ADB 设备查询失败或超时不再影响其他设备，并防止旧刷新结果覆盖新状态",
-    "增加任务状态、弱网启动、ADB 渐进刷新及核心页面切换的自动化冒烟测试"
+    "多语言检查可根据文件名推荐本次目标语言，并在报告中记录实际检查范围",
+    "重复表头、子表头和非文本流程控制行不再误报为空翻译、空源文或无效 ID",
+    "修复 todo、todos、metodo 等自然语言被误识别为未完成占位文本的问题",
+    "完善 Excel 短日期格式、数字词、本地化月份、换行格式符和注册标签检查",
+    "译文复用分析改为默认关闭的低置信度辅助项，不计入明确错误总数",
+    "报告新增源文本问题、人工确认、语言覆盖和译文复用等分类，所有明细自带筛选"
   ]
 }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import unittest
 from types import SimpleNamespace
 
@@ -68,6 +69,14 @@ class BasicUISmokeTests(unittest.TestCase):
             "config_validator",
         ):
             self.assertIn(page, flattened)
+
+    def test_configuration_change_notification_is_not_exposed(self):
+        sidebar_source = inspect.getsource(XiaoXinAssistant._build_sidebar)
+        page_source = inspect.getsource(XiaoXinAssistant.show_page)
+        startup_source = inspect.getsource(XiaoXinAssistant._finish_background_startup)
+        for source in (sidebar_source, page_source, startup_source):
+            self.assertNotIn("gitlab_monitor", source)
+            self.assertNotIn("配置变更通知", source)
 
 
 if __name__ == "__main__":

@@ -10,9 +10,11 @@ from pathlib import Path
 from openpyxl import Workbook, load_workbook
 
 from app.localization_checker import (
+    LocalizationColumn,
     LocalizationCheckOptions,
     check_localization_file,
     export_localization_issues_to_excel,
+    recommend_target_languages_from_filename,
 )
 
 
@@ -129,13 +131,140 @@ class LocalizationRulesV2Tests(unittest.TestCase):
         report = load_workbook(report_path, read_only=False, data_only=True)
         try:
             self.assertEqual(
-                ["汇总说明", "明确问题", "源文本问题", "需人工确认", "语言覆盖范围", "忽略项或白名单命中", "全部明细", "规则说明"],
+                ["汇总说明", "明确问题", "源文本问题", "需人工确认", "译文复用分析", "语言覆盖范围", "忽略项或白名单命中", "全部明细", "规则说明"],
                 report.sheetnames,
             )
             for sheet_name in report.sheetnames:
                 self.assertTrue(report[sheet_name].auto_filter.ref)
         finally:
             report.close()
+
+    def test_filename_language_recommendation_uses_standalone_codes(self):
+        columns = [LocalizationColumn(name=code, header=code, code=code, index=index) for index, code in enumerate(["CN", "EN", "ID", "IT", "TR", "DE"])]
+        self.assertEqual(
+            ["IT", "TR", "ID"],
+            recommend_target_languages_from_filename("TP-story-IT_TR_ID.xlsx", columns),
+        )
+        self.assertEqual([], recommend_target_languages_from_filename("story_ID.xlsx", columns))
+
+    def test_embedded_headers_todo_boundaries_control_rows_and_invalid_id(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        path = Path(temp.name) / "TP-story-IT_TR_ID.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Text"
+        sheet.append(["ID", "类型", "人物", "备注", "CN", "EN Final", "Indonesian", "Italian", "Turkish"])
+        sheet.append(["ID12", "事件类型", "类型子项", "动作", "对白文字", "", "", "", ""])
+        sheet.append(["control", "转场动画", "", "", "", "", "", "", ""])
+        sheet.append(["source_missing", "旁白", "", "", "", "Reference", "Terjemahan", "Traduzione", "Çeviri"])
+        sheet.append([None, "旁白", "", "正式内容", "中文", "English", "Indonesia", "Italiano", "Türkçe"])
+        sheet.append(["empty", "旁白", "", "", "中文", "English", "", "", ""])
+        sheet.append(["natural", "旁白", "", "", "方法", "Method", "todo", "metodo", "todos"])
+        sheet.append(["marker", "旁白", "", "", "待处理", "TODO", "TODO", "Traduzione", "Çeviri"])
+        workbook.save(path)
+
+        issues, table, _columns = check_localization_file(
+            str(path),
+            LocalizationCheckOptions(
+                table_structure="单 Sheet 多语言列",
+                source_language_column="CN",
+                enabled_language_columns=["ID", "IT", "TR"],
+                check_chinese=False,
+                check_spelling=False,
+                check_terms=False,
+                check_duplicate_translation=False,
+                aggregate_empty_language_columns=False,
+            ),
+            threading.Event(),
+        )
+        self.assertNotIn("ID12", table.records)
+        by_id = collections.defaultdict(list)
+        for item in issues:
+            by_id[item.item_id].append(item)
+        self.assertFalse(by_id["control"])
+        self.assertEqual(1, len([item for item in by_id["source_missing"] if item.result_category == "源文本问题"]))
+        self.assertEqual(1, len([item for item in issues if item.issue_type == "无效 ID"]))
+        self.assertEqual(3, len([item for item in by_id["empty"] if item.issue_type == "空翻译"]))
+        self.assertFalse(any(item.issue_type == "未完成/修改中占位文本" for item in by_id["natural"]))
+        self.assertEqual(1, len([item for item in by_id["marker"] if item.issue_type == "未完成/修改中占位文本"]))
+
+    def test_short_date_number_words_months_reversed_newline_and_e_tag(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        path = Path(temp.name) / "rules-IT_TR_ID.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Text"
+        sheet.append(["ID", "类型", "CN", "Indonesian", "Italian", "Turkish"])
+        sheet.append(["date", "标题", datetime(2022, 1, 1), "Bintang Jatuh", "Stella caduta", "Düşen Yıldız"])
+        sheet["C2"].number_format = "m\\-d"
+        sheet.append(["days", "旁白", "五天之后", "lima hari kemudian", "cinque giorni dopo", "Beş gün sonra"])
+        sheet.append(["month", "标题", "7月份", "Juli", "Luglio", "Temmuz"])
+        sheet.append(["idiom", "旁白", "那只是零星的希望", "Harapan yang samar", "Una speranza vaga", "Belirsiz bir umut"])
+        sheet.append(["newline", "旁白", "n/奥兹大王将会到来", "\\nOz akan datang", "\\nOz arriverà", "\\nOz gelecek"])
+        sheet.append(["tag_good", "旁白", "[e]文本[/e]", "[e]Teks[/e]", "[e]Testo[/e]", "[e]Metin[/e]"])
+        sheet.append(["tag_source_bad", "旁白", "[e]文本[e]", "Text", "Testo", "Metin"])
+        sheet.append(["tag_target_bad", "旁白", "[e]文本[/e]", "[e]Teks[/e]", "[e]Testo[e]", "[e]Metin[/e]"])
+        sheet.append(["bracket", "旁白", "活动名称", "[Masa Intim]", "[Momenti intimi]", "[Samimi Anlar]"])
+        workbook.save(path)
+
+        issues, _table, _columns = check_localization_file(
+            str(path),
+            LocalizationCheckOptions(
+                table_structure="单 Sheet 多语言列",
+                source_language_column="CN",
+                enabled_language_columns=["ID", "IT", "TR"],
+                check_chinese=False,
+                check_spelling=False,
+                check_terms=False,
+                check_duplicate_translation=False,
+                aggregate_empty_language_columns=False,
+            ),
+            threading.Event(),
+        )
+        by_id = collections.defaultdict(list)
+        for item in issues:
+            by_id[item.item_id].append(item)
+        date_issues = [item for item in by_id["date"] if item.issue_type == "源文本单元格格式异常"]
+        self.assertEqual(1, len(date_issues))
+        self.assertFalse(any(item.rule_name == "数值" for item in by_id["date"]))
+        for text_id in ("days", "month", "idiom"):
+            self.assertFalse(any(item.rule_name == "数值" for item in by_id[text_id]), text_id)
+        self.assertEqual(1, len([item for item in by_id["newline"] if item.issue_type == "源文本换行格式符疑似写反"]))
+        self.assertFalse(any(item.issue_type == "换行符数量差异" for item in by_id["newline"]))
+        self.assertFalse(any("标签" in item.issue_type for item in by_id["tag_good"]))
+        self.assertEqual(1, len([item for item in by_id["tag_source_bad"] if item.result_category == "源文本问题"]))
+        self.assertIn("目标文本标签结构异常", [item.issue_type for item in by_id["tag_target_bad"]])
+        self.assertFalse(any("标签" in item.issue_type for item in by_id["bracket"]))
+
+    def test_duplicate_translation_is_separate_optional_analysis(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        path = Path(temp.name) / "reuse.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["ID", "CN", "Italian"])
+        sheet.append(["a", "第一段完全不同的中文源文", "Questa è la stessa traduzione molto lunga"])
+        sheet.append(["b", "另一段含义不同的中文内容", "Questa è la stessa traduzione molto lunga"])
+        workbook.save(path)
+        base = dict(
+            table_structure="单 Sheet 多语言列",
+            source_language_column="CN",
+            enabled_language_columns=["IT"],
+            check_chinese=False,
+            check_spelling=False,
+            check_terms=False,
+            aggregate_empty_language_columns=False,
+        )
+        issues_off, _table, _columns = check_localization_file(str(path), LocalizationCheckOptions(**base), threading.Event())
+        self.assertFalse(any(item.rule_name == "译文重复" for item in issues_off))
+        issues_on, _table, _columns = check_localization_file(
+            str(path), LocalizationCheckOptions(**base, check_duplicate_translation=True), threading.Event()
+        )
+        reuse = [item for item in issues_on if item.rule_name == "译文重复"]
+        self.assertTrue(reuse)
+        self.assertTrue(all(item.result_category == "译文复用分析" and not item.count_in_error_stats for item in reuse))
 
 
 if __name__ == "__main__":
