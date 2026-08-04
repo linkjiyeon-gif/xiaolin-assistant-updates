@@ -41,6 +41,16 @@ from .localization_sheet_parser import (
 ProgressCallback = Callable[[Dict[str, object]], None]
 
 
+def _date_format_without_year(number_format: str) -> bool:
+    normalized = re.sub(r'"[^"]*"|\[[^\]]*\]', "", str(number_format or "").lower())
+    normalized = normalized.replace("\\", "")
+    normalized = re.sub(r"\s+", "", normalized)
+    # Only the compact m-d / m/d family is treated as a suspicious chapter
+    # number conversion.  Normal localized date formats such as ``mmmm d``
+    # remain real dates and keep the historical date-equivalence behavior.
+    return bool(re.fullmatch(r"m{1,2}[-/]d{1,2}", normalized))
+
+
 def _localization_cell_text(cell_or_value) -> str:
     """Convert an Excel cell/value without leaking date serials or midnight text.
 
@@ -51,24 +61,47 @@ def _localization_cell_text(cell_or_value) -> str:
     value = cell.value if cell is not None else cell_or_value
     if value is None:
         return ""
+    number_format = str(getattr(cell, "number_format", "") or "") if cell is not None else ""
     if isinstance(value, datetime):
+        if _date_format_without_year(number_format):
+            return f"{value.month}-{value.day}"
         if value.time() == time.min:
             return value.date().isoformat()
         return value.isoformat(sep=" ", timespec="seconds")
     if isinstance(value, date):
+        if _date_format_without_year(number_format):
+            return f"{value.month}-{value.day}"
         return value.isoformat()
     if isinstance(value, time):
         return value.isoformat(timespec="seconds")
     return str(value)
 
 
-def _worksheet_rows_as_text(ws, *, max_rows: int | None = None, strip: bool = False) -> List[List[str]]:
+def _worksheet_rows_as_text(
+    ws,
+    *,
+    max_rows: int | None = None,
+    strip: bool = False,
+    metadata: Dict[Tuple[int, int], "LocalizationCellMetadata"] | None = None,
+) -> List[List[str]]:
     rows: List[List[str]] = []
     kwargs = {"min_row": 1}
     if max_rows is not None:
         kwargs["max_row"] = max_rows
     for row in ws.iter_rows(**kwargs):
-        values = [_localization_cell_text(cell) for cell in row]
+        values = []
+        for cell in row:
+            display_value = _localization_cell_text(cell)
+            values.append(display_value)
+            raw_value = getattr(cell, "value", None)
+            if metadata is not None and raw_value is not None:
+                metadata[(int(getattr(cell, "row", 0)), int(getattr(cell, "column", 0)) - 1)] = LocalizationCellMetadata(
+                    raw_value=raw_value,
+                    display_value=display_value,
+                    data_type=str(getattr(cell, "data_type", "") or ""),
+                    number_format=str(getattr(cell, "number_format", "") or ""),
+                    is_date=bool(getattr(cell, "is_date", False)),
+                )
         rows.append([value.strip() for value in values] if strip else values)
     return rows
 
@@ -116,10 +149,21 @@ class LocalizationColumn:
 
 
 @dataclass
+class LocalizationCellMetadata:
+    raw_value: object = None
+    display_value: str = ""
+    data_type: str = ""
+    number_format: str = ""
+    is_date: bool = False
+
+
+@dataclass
 class LocalizationRow:
     text_id: str
     row_number: int
     values: Dict[int, str]
+    row_type: str = ""
+    cell_metadata: Dict[int, LocalizationCellMetadata] = field(default_factory=dict)
 
 
 @dataclass
@@ -139,6 +183,7 @@ class LocalizationTable:
     excluded_columns: Dict[str, str] = field(default_factory=dict)
     diagnostics: List[str] = field(default_factory=list)
     row_records: List[LocalizationRow] = field(default_factory=list)
+    invalid_row_records: List[LocalizationRow] = field(default_factory=list)
 
 
 @dataclass
@@ -171,10 +216,13 @@ class LocalizationCheckOptions:
     check_unfinished: bool = True
     check_spelling: bool = True
     check_terms: bool = True
-    check_duplicate_translation: bool = True
+    check_duplicate_translation: bool = False
     aggregate_empty_language_columns: bool = True
     precomputed_multi_table_sheets: List[Tuple[str, int, str]] = field(default_factory=list)
     empty_requires_source_text: bool = False
+    text_row_types_text: str = "对白,说话,旁白,文本,标题,选项,按钮,提示,名字,名称,字幕,描述,转场文字,dialogue,speech,text,title,option,button,tip,name,caption,description"
+    non_text_row_types_text: str = "转场动画,跳转,切换场景,模型出现,模型消失,玩法,镜头效果,关卡结束,分支节点,transition,jump,switch scene,model appear,model disappear,gameplay,camera,stage end,branch"
+    unfinished_markers_text: str = "TODO,TBD,FIXME,翻译未完成,翻譯未完成,翻译错误，修改中,翻譯錯誤，修改中,待翻译,待翻譯,未翻译,未翻譯,untranslated,need translation,needs translation"
 
 
 @dataclass
@@ -206,6 +254,7 @@ class LocalizationIssue:
     coverage_filled: int = 0
     coverage_blank: int = 0
     coverage_status: str = ""
+    row_type: str = ""
 
 
 @dataclass
@@ -312,6 +361,28 @@ DICTIONARY_FILE_LANGUAGE_MAP = {
 
 def _split_config_values(raw: str) -> List[str]:
     return [part.strip() for part in re.split(r"[,，;；|\n]+", raw or "") if part.strip()]
+
+
+def recommend_target_languages_from_filename(path: str, detected_columns: Sequence[LocalizationColumn]) -> List[str]:
+    """Recommend a target-language subset without overriding the user's choice.
+
+    A recommendation is only made when the filename contains at least two
+    standalone language-code tokens.  This avoids treating an ordinary ``ID``
+    filename fragment as the Indonesian language unless it appears in an
+    explicit language bundle such as ``IT_TR_ID``.
+    """
+    available = {str(column.code or column.header or "").upper() for column in detected_columns}
+    if not available:
+        return []
+    stem = Path(str(path or "")).stem.upper()
+    tokens = [token for token in re.split(r"[^A-Z0-9]+", stem) if token]
+    aliases = {"JA": "JP", "KO": "KR", "VI": "VN", "AR": "ARB", "PTBR": "PT_BR", "ZH": "CN"}
+    matched: List[str] = []
+    for token in tokens:
+        code = aliases.get(token, token)
+        if code in available and code not in {"CN", "TW", "EN"} and code not in matched:
+            matched.append(code)
+    return matched if len(matched) >= 2 else []
 
 
 def _format_identifier(value) -> str:
@@ -737,6 +808,69 @@ def _row_looks_like_data(row: Sequence[str]) -> bool:
     return numeric_id_like and body_cells >= 1
 
 
+FIELD_SEMANTIC_PATTERNS: Dict[str, Tuple[str, ...]] = {
+    "id": ("id", "text_id", "tid", "key", "文本id", "字串id", "编号", "編號"),
+    "type": ("类型", "類型", "event_type", "eventtype", "type", "category", "分类", "分類", "子项", "子項"),
+    "character": ("人物", "角色", "speaker", "character", "actor", "npc_name", "npcname", "性别", "性別"),
+    "note_action": ("备注", "備註", "note", "comment", "动作", "動作", "action", "说明", "說明"),
+    "text": ("源文", "原文", "译文", "譯文", "翻译", "翻譯", "source_text", "target_text", "translation", "contents", "content", "对白", "對白", "dialogue", "npc_name"),
+    "language": ("语言", "語言", "language", "中文", "英文", "英语", "英語", "简体", "繁体", "繁體"),
+}
+
+
+def _field_semantic_categories(value: str) -> set[str]:
+    raw = str(value or "").strip()
+    if not raw or len(raw) > 48 or _looks_like_body_text(raw):
+        return set()
+    normalized = _normalize_column_key(raw)
+    compact = normalized.replace("_", "")
+    result: set[str] = set()
+    if re.fullmatch(r"(?:#?id|tid|textid)\d*", compact, re.IGNORECASE):
+        result.add("id")
+    for category, aliases in FIELD_SEMANTIC_PATTERNS.items():
+        for alias in aliases:
+            alias_norm = _normalize_column_key(alias)
+            alias_compact = alias_norm.replace("_", "")
+            if normalized == alias_norm or compact == alias_compact:
+                result.add(category)
+                break
+            if len(alias_compact) >= 2 and len(compact) <= 24 and (alias_compact in compact or compact in alias_compact):
+                result.add(category)
+                break
+    return result
+
+
+def _is_embedded_header_row(row: Sequence[str], headers: Sequence[str], key_col: int) -> bool:
+    values = [str(value or "").strip() for value in row]
+    non_empty = [value for value in values if value]
+    if not non_empty or len(non_empty) > 10:
+        return False
+    normalized_headers = {_normalize_column_key(value) for value in headers if str(value or "").strip()}
+    exact_matches = sum(1 for value in non_empty if _normalize_column_key(value) in normalized_headers)
+    categories: set[str] = set()
+    header_like_cells = 0
+    for value in non_empty:
+        found = _field_semantic_categories(value)
+        if found:
+            header_like_cells += 1
+            categories.update(found)
+    key_value = values[key_col] if 0 <= key_col < len(values) else ""
+    id_descriptor = bool(re.fullmatch(r"(?:#?id|tid|text[_ ]?id)\d*", key_value, re.IGNORECASE))
+    return exact_matches >= 2 or (
+        header_like_cells >= 3
+        and len(categories) >= 3
+        and (id_descriptor or "text" in categories)
+    )
+
+
+def _find_row_type_column(headers: Sequence[str]) -> int:
+    priority = {"类型", "類型", "event_type", "eventtype", "row_type", "type", "category"}
+    for index, header in enumerate(headers):
+        if _normalize_column_key(header) in priority:
+            return index
+    return -1
+
+
 @lru_cache(maxsize=4096)
 def _language_from_header(header: str, display_header: str = "") -> Tuple[str, str, str]:
     """Return (code, name, confidence).
@@ -1095,11 +1229,16 @@ def detect_multi_table_sheet_columns(path: str, options: LocalizationCheckOption
     return candidates, columns
 
 
-def _read_localization_table_rows(path: str, sheet_name: str, forced_header_row: int = 0, forced_data_start_row: int = 0) -> Tuple[List[List[str]], str, List[str]]:
+def _read_localization_table_rows(
+    path: str,
+    sheet_name: str,
+    forced_header_row: int = 0,
+    forced_data_start_row: int = 0,
+) -> Tuple[List[List[str]], str, List[str], Dict[Tuple[int, int], LocalizationCellMetadata]]:
     file_path = Path(path)
     if file_path.suffix.lower() != ".xlsx":
         rows, actual_sheet = read_table_rows(path, sheet_name)
-        return rows, actual_sheet, []
+        return rows, actual_sheet, [], {}
 
     try:
         from openpyxl import load_workbook
@@ -1107,6 +1246,7 @@ def _read_localization_table_rows(path: str, sheet_name: str, forced_header_row:
         raise FileReadError("缺少依赖 openpyxl，请先安装 requirements.txt") from exc
 
     wb = load_workbook(file_path, data_only=True, read_only=True)
+    cell_metadata: Dict[Tuple[int, int], LocalizationCellMetadata] = {}
     try:
         if sheet_name and sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
@@ -1114,7 +1254,7 @@ def _read_localization_table_rows(path: str, sheet_name: str, forced_header_row:
                 ws.reset_dimensions()
             except Exception:
                 pass
-            return _worksheet_rows_as_text(ws), ws.title, []
+            return _worksheet_rows_as_text(ws, metadata=cell_metadata), ws.title, [], cell_metadata
         scored: List[Tuple[int, str, str]] = []
         for ws in wb.worksheets:
             sample_rows = _sample_worksheet_rows(ws)
@@ -1128,7 +1268,7 @@ def _read_localization_table_rows(path: str, sheet_name: str, forced_header_row:
                 ws.reset_dimensions()
             except Exception:
                 pass
-            rows = _worksheet_rows_as_text(ws)
+            rows = _worksheet_rows_as_text(ws, metadata=cell_metadata)
         else:
             rows = []
     finally:
@@ -1136,16 +1276,16 @@ def _read_localization_table_rows(path: str, sheet_name: str, forced_header_row:
 
     if not best_sheet:
         rows, actual_sheet = read_table_rows(path, "")
-        return rows, actual_sheet, []
+        return rows, actual_sheet, [], {}
 
     diagnostics = [f"自动选择数据 Sheet：{best_sheet}（评分 {best_score}，{best_reason}）"]
-    return rows, best_sheet, diagnostics
+    return rows, best_sheet, diagnostics, cell_metadata
 
 
 def parse_localization_table(options: LocalizationCheckOptions, path: str) -> LocalizationTable:
     forced_header = safe_int(options.header_row, 1) if safe_int(options.header_row, 1) > 1 else 0
     forced_start = safe_int(options.data_start_row, 2) if safe_int(options.data_start_row, 2) > 2 else 0
-    rows, actual_sheet, auto_sheet_diagnostics = _read_localization_table_rows(path, options.sheet_name, forced_header, forced_start)
+    rows, actual_sheet, auto_sheet_diagnostics, cell_metadata = _read_localization_table_rows(path, options.sheet_name, forced_header, forced_start)
     if not rows:
         raise FileReadError(f"文件为空：{path}")
 
@@ -1177,11 +1317,21 @@ def parse_localization_table(options: LocalizationCheckOptions, path: str) -> Lo
     row_records: List[LocalizationRow] = []
     id_rows: Dict[str, List[int]] = {}
     invalid_rows: List[int] = []
+    invalid_row_records: List[LocalizationRow] = []
+    row_type_col = _find_row_type_column(headers)
+    metadata_by_row: Dict[int, Dict[int, LocalizationCellMetadata]] = defaultdict(dict)
+    for (meta_row, meta_col), meta in cell_metadata.items():
+        metadata_by_row[meta_row][meta_col] = meta
     for row_index in range(data_start_index, len(rows)):
         row = rows[row_index]
         row_number = row_index + 1
         if not any(str(cell).strip() for cell in row):
             continue
+        if _is_embedded_header_row(row, headers, key_col):
+            continue
+        values = {index: (str(row[index]) if index < len(row) and row[index] is not None else "") for index in range(len(headers))}
+        row_meta = dict(metadata_by_row.get(row_number, {}))
+        row_type = values.get(row_type_col, "") if row_type_col >= 0 else ""
         text_id = _format_identifier(row[key_col]) if key_col < len(row) else ""
         if not text_id:
             # 说明行/备注行不计入无效 ID；有多个语言列文本但没有主键才提示。
@@ -1193,10 +1343,10 @@ def parse_localization_table(options: LocalizationCheckOptions, path: str) -> Lo
                     language_like_values += 1
             if language_like_values >= 2:
                 invalid_rows.append(row_number)
+                invalid_row_records.append(LocalizationRow("", row_number, values, row_type=row_type, cell_metadata=row_meta))
             continue
-        values = {index: (str(row[index]) if index < len(row) and row[index] is not None else "") for index in range(len(headers))}
         id_rows.setdefault(text_id, []).append(row_number)
-        row_record = LocalizationRow(text_id=text_id, row_number=row_number, values=values)
+        row_record = LocalizationRow(text_id=text_id, row_number=row_number, values=values, row_type=row_type, cell_metadata=row_meta)
         row_records.append(row_record)
         if text_id not in records:
             records[text_id] = row_record
@@ -1232,6 +1382,7 @@ def parse_localization_table(options: LocalizationCheckOptions, path: str) -> Lo
         excluded_columns=excluded_columns,
         diagnostics=diagnostics,
         row_records=row_records,
+        invalid_row_records=invalid_row_records,
     )
 
 
@@ -1241,6 +1392,7 @@ def _localization_table_from_rows(
     rows: List[List[str]],
     actual_sheet: str,
     auto_sheet_diagnostics: Sequence[str] | None = None,
+    cell_metadata: Dict[Tuple[int, int], LocalizationCellMetadata] | None = None,
 ) -> LocalizationTable:
     forced_header = safe_int(options.header_row, 1) if safe_int(options.header_row, 1) > 1 else 0
     forced_start = safe_int(options.data_start_row, 2) if safe_int(options.data_start_row, 2) > 2 else 0
@@ -1275,11 +1427,22 @@ def _localization_table_from_rows(
     row_records: List[LocalizationRow] = []
     id_rows: Dict[str, List[int]] = {}
     invalid_rows: List[int] = []
+    invalid_row_records: List[LocalizationRow] = []
+    row_type_col = _find_row_type_column(headers)
+    cell_metadata = cell_metadata or {}
+    metadata_by_row: Dict[int, Dict[int, LocalizationCellMetadata]] = defaultdict(dict)
+    for (meta_row, meta_col), meta in cell_metadata.items():
+        metadata_by_row[meta_row][meta_col] = meta
     for row_index in range(data_start_index, len(rows)):
         row = rows[row_index]
         row_number = row_index + 1
         if not any(str(cell).strip() for cell in row):
             continue
+        if _is_embedded_header_row(row, headers, key_col):
+            continue
+        values = {index: (str(row[index]) if index < len(row) and row[index] is not None else "") for index in range(len(headers))}
+        row_meta = dict(metadata_by_row.get(row_number, {}))
+        row_type = values.get(row_type_col, "") if row_type_col >= 0 else ""
         text_id = _format_identifier(row[key_col]) if key_col < len(row) else ""
         if not text_id:
             language_like_values = 0
@@ -1290,10 +1453,10 @@ def _localization_table_from_rows(
                     language_like_values += 1
             if language_like_values >= 2:
                 invalid_rows.append(row_number)
+                invalid_row_records.append(LocalizationRow("", row_number, values, row_type=row_type, cell_metadata=row_meta))
             continue
-        values = {index: (str(row[index]) if index < len(row) and row[index] is not None else "") for index in range(len(headers))}
         id_rows.setdefault(text_id, []).append(row_number)
-        row_record = LocalizationRow(text_id=text_id, row_number=row_number, values=values)
+        row_record = LocalizationRow(text_id=text_id, row_number=row_number, values=values, row_type=row_type, cell_metadata=row_meta)
         row_records.append(row_record)
         if text_id not in records:
             records[text_id] = row_record
@@ -1329,6 +1492,7 @@ def _localization_table_from_rows(
         excluded_columns=excluded_columns,
         diagnostics=diagnostics,
         row_records=row_records,
+        invalid_row_records=invalid_row_records,
     )
 
 
@@ -1545,7 +1709,7 @@ ESCAPED_NEWLINE_RE = re.compile(r"\\n")
 ANGLE_TAG_RE = re.compile(r"<\s*(/)?\s*([A-Za-z][\w\-]*)(?:\s+([^<>]*?))?\s*(/)?>")
 BRACKET_TAG_RE = re.compile(r"\[\s*(/)?\s*([A-Za-z][\w\-]*)(?:(?:\s+|=)([^\]]*?))?\s*\]")
 ANY_ANGLE_TAG_RE = re.compile(r"<[^<>]*>")
-ANY_BRACKET_TAG_RE = re.compile(r"\[(?:/?(?:color|size|font|b|i|u|url|ref|link|br)(?:(?:\s+|=)[^\]]*)?)\]", re.IGNORECASE)
+ANY_BRACKET_TAG_RE = re.compile(r"\[(?:/?(?:color|size|font|b|i|u|e|url|ref|link|br)(?:(?:\s+|=)[^\]]*)?)\]", re.IGNORECASE)
 PLACEHOLDER_SIGNAL_RE = re.compile(r"[%$#\\{}\[\]<>]")
 TAG_SIGNAL_RE = re.compile(r"[\[\]<>]")
 NUMBER_SIGNAL_RE = re.compile(r"[0-9零〇一二两兩俩倆三四五六七八九十百千万萬ⅠⅡⅢⅣⅤ%％]")
@@ -1556,6 +1720,10 @@ DOLLAR_PLACEHOLDER_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
 IDENTIFIER_NUMBER_RE = re.compile(r"(?<![A-Za-z0-9_])(?:[A-Za-z_][A-Za-z0-9_]*\d+[A-Za-z0-9_]*(?:\.\d+)*)(?![A-Za-z0-9_])")
 DATE_RE = re.compile(r"(?<!\d)(\d{4})[/-](\d{1,2})[/-](\d{1,2})(?!\d)")
 CN_DATE_RE = re.compile(r"([一二三四五六七八九十两兩俩倆零〇0-9]{1,4})\s*月\s*([一二三四五六七八九十两兩俩倆零〇0-9]{1,4})\s*[日号號]")
+CN_MONTH_RE = re.compile(r"([一二三四五六七八九十两兩俩倆零〇0-9]{1,3})\s*月份")
+CN_MONTH_DURATION_RE = re.compile(r"([一二三四五六七八九十两兩俩倆零〇0-9]{1,4})\s*(?:个|個)?月(?:后|後|前|内|內|时间|時間)?")
+ID_ONE_MONTH_RE = re.compile(r"(?<![A-Za-zÀ-ž])sebulan(?![A-Za-zÀ-ž])", re.IGNORECASE)
+IT_ONE_MONTH_RE = re.compile(r"(?<![A-Za-zÀ-ž])un\s+mese(?![A-Za-zÀ-ž])", re.IGNORECASE)
 TIME_RE = re.compile(r"(?<!\d)([01]?\d|2[0-3]):([0-5]\d)(?!\d)")
 CN_HOUR_RE = re.compile(r"(?<!\d)([01]?\d|2[0-3])\s*(?:点|點|时|時)(?!\d)")
 LV_STAGE_RE = re.compile(
@@ -1577,9 +1745,11 @@ EN_PREFIX_NUMBER_RE = re.compile(
     r"\b(?:chapter|stage|round|tier|level|goal)\s+(one|two|three|four|five|six|seven|eight|nine|ten)\b",
     re.IGNORECASE,
 )
-CN_STRONG_NUMBER_UNIT_RE = re.compile(r"([一二三四五六七八九十两兩俩倆百千万萬零〇]+)\s*(?:秒|毫秒|分钟|分鐘|小时|小時|天|日|倍|级|級|星|輪|轮|回)")
+CN_STRONG_NUMBER_UNIT_RE = re.compile(r"([一二三四五六七八九十两兩俩倆百千万萬零〇]+)\s*(?:秒|毫秒|分钟|分鐘|小时|小時|天|日|倍|级|級|星|輪|轮|回|点|點)")
+CN_APPROX_RANGE_RE = re.compile(r"([一二两兩俩倆三四五六七八九])([一二两兩俩倆三四五六七八九])\s*(?:个|個|名|次|分钟|分鐘|小时|小時|天|日|月)")
 CN_NATURAL_ONE_RE = re.compile(r"(?<!第)(?:一|壹|１)\s*(?:个|個|名|张|張|拳|次|层|層|件|份|本|支|枚|项|項|位|条|條|颗|顆|只|隻)")
 CN_NATURAL_ARABIC_ONE_RE = re.compile(r"(?<!第)1\s*(?:次|层|層)")
+CN_LEXICAL_NUMBER_RE = re.compile(r"(?:零星|北斗七星|三分钟热度|三分鐘熱度)")
 CN_ORDINAL_RE = re.compile(r"第\s*([一二三四五六七八九十两兩俩倆百千万萬零〇0-9]+)\s*(?:次|层|層|轮|輪|回|阶段|階段|章|章节|章節|节|節)")
 ROMAN_NUMERAL_RE = re.compile(r"(?<![A-Za-z0-9_])([ⅠⅡⅢⅣⅤ])(?!(?:[A-Za-z0-9_]))")
 ASCII_ROMAN_RE = re.compile(r"(?<![A-Za-z0-9_])((?:IV|V|III|II|I))(?![A-Za-z0-9_])")
@@ -1592,9 +1762,9 @@ NUMBER_UNIT_PATTERN = r"(?:milliseconds?|msecs?|ms|seconds?|secs?|sec|minutes?|m
 NUMBER_WITH_UNIT_RE = re.compile(r"(?<![A-Za-z0-9_])([+-]?(?:(?:\d{1,3}(?:,\d{3})+)|\d+)(?:\.\d+)?)\s*" + NUMBER_UNIT_PATTERN + r"(?![A-Za-z0-9_])", re.IGNORECASE)
 NUMBER_RE = re.compile(r"(?<![A-Za-z0-9_])((?:(?:\d{1,3}(?:,\d{3})+)|\d+)(?:\.\d+)?)(?![A-Za-z0-9_])")
 
-RICH_TAG_NAMES = {"color", "b", "i", "u", "size", "font", "url", "ref", "link", "br"}
+RICH_TAG_NAMES = {"color", "b", "i", "u", "e", "size", "font", "url", "ref", "link", "br"}
 SELF_CLOSING_TAG_NAMES = {"br"}
-STYLE_TAG_NAMES = {"color", "size", "font"}
+STYLE_TAG_NAMES = {"color", "size", "font", "e"}
 FUNCTIONAL_TAG_NAMES = {"url", "ref", "link"}
 NATURAL_PUNCT_EQUIVALENTS = {
     "：": {"：", ":"}, ":": {"：", ":"},
@@ -1610,7 +1780,7 @@ INVISIBLE_TEXT_RE = re.compile(r"[\s\u200b\u200c\u200d\u2060\ufeff]+")
 
 UNFINISHED_TEXT_PATTERNS = [
     "翻译未完成", "翻譯未完成", "翻译错误，修改中", "翻譯錯誤，修改中", "待翻译", "待翻譯",
-    "未翻译", "未翻譯", "todo", "tbd", "untranslated", "need translation", "needs translation",
+    "未翻译", "未翻譯", "TODO", "TBD", "FIXME", "untranslated", "need translation", "needs translation",
 ]
 
 SPELLING_SUSPECT_PATTERNS = [
@@ -1638,12 +1808,28 @@ def _language_code_from_label(language: str) -> str:
     return normalized if normalized in LANGUAGE_META else ""
 
 
-def _contains_unfinished_marker(text: str) -> str:
+def _contains_unfinished_marker(text: str, patterns_text: str = "") -> str:
     value = ("" if text is None else str(text)).strip()
-    normalized = value.lower()
-    for pattern in UNFINISHED_TEXT_PATTERNS:
-        if pattern.lower() in normalized:
-            return pattern
+    # Chinese commas may be part of a configured phrase such as
+    # “翻译错误，修改中”, so only ASCII separators split this setting.
+    patterns = [part.strip() for part in re.split(r"[,;\n]+", patterns_text or "") if part.strip()] if patterns_text else UNFINISHED_TEXT_PATTERNS
+    for pattern in patterns:
+        marker = str(pattern or "").strip()
+        if not marker:
+            continue
+        if marker.upper() in {"TODO", "TBD", "FIXME"}:
+            # These development markers are conventionally uppercase.  A
+            # lowercase natural-language word such as Spanish ``todo`` or the
+            # substring in Italian ``metodo`` must not be treated as a marker.
+            if re.search(rf"(?<![A-Za-z0-9_]){re.escape(marker.upper())}(?![A-Za-z0-9_])", value):
+                return marker.upper()
+            continue
+        if re.search(r"[A-Za-z]", marker):
+            if re.search(rf"(?<![A-Za-z0-9_]){re.escape(marker)}(?![A-Za-z0-9_])", value, re.IGNORECASE):
+                return marker
+            continue
+        if marker in value:
+            return marker
     return ""
 
 
@@ -1678,6 +1864,60 @@ def _jp_chinese_residual_level(text: str) -> Tuple[str, str]:
 _CN_NUM = {"零":0,"〇":0,"一":1,"二":2,"两":2,"兩":2,"俩":2,"倆":2,"三":3,"四":4,"五":5,"六":6,"七":7,"八":8,"九":9}
 _EN_NUM = {"once":1,"one":1,"twice":2,"two":2,"three":3,"four":4,"five":5,"six":6,"seven":7,"eight":8,"nine":9,"ten":10,"first":1,"second":2,"third":3,"fourth":4,"fifth":5,"sixth":6,"seventh":7,"eighth":8,"ninth":9,"tenth":10}
 _ROMAN_NUM = {"Ⅰ":1,"Ⅱ":2,"Ⅲ":3,"Ⅳ":4,"Ⅴ":5,"I":1,"II":2,"III":3,"IV":4,"V":5}
+
+_ID_NUM_WORDS = {
+    "nol": 0, "satu": 1, "dua": 2, "tiga": 3, "empat": 4, "lima": 5, "enam": 6,
+    "tujuh": 7, "delapan": 8, "sembilan": 9, "sepuluh": 10, "sebelas": 11,
+}
+for _tens_word, _tens_value in (("dua puluh", 20), ("tiga puluh", 30)):
+    _ID_NUM_WORDS[_tens_word] = _tens_value
+    for _unit_word, _unit_value in list(_ID_NUM_WORDS.items()):
+        if 1 <= _unit_value <= 9 and " " not in _unit_word:
+            _ID_NUM_WORDS[f"{_tens_word} {_unit_word}"] = _tens_value + _unit_value
+for _unit_word, _unit_value in list(_ID_NUM_WORDS.items()):
+    if 2 <= _unit_value <= 9 and " " not in _unit_word:
+        _ID_NUM_WORDS[f"{_unit_word} belas"] = 10 + _unit_value
+
+_IT_NUMBER_NAMES = [
+    "zero", "uno", "due", "tre", "quattro", "cinque", "sei", "sette", "otto", "nove", "dieci",
+    "undici", "dodici", "tredici", "quattordici", "quindici", "sedici", "diciassette", "diciotto", "diciannove",
+    "venti", "ventuno", "ventidue", "ventitré", "ventiquattro", "venticinque", "ventisei", "ventisette", "ventotto", "ventinove",
+    "trenta", "trentuno",
+]
+_IT_NUM_WORDS = {word: value for value, word in enumerate(_IT_NUMBER_NAMES)}
+
+_TR_NUM_WORDS = {
+    "sıfır": 0, "sifir": 0, "bir": 1, "iki": 2, "üç": 3, "uc": 3, "dört": 4, "dort": 4,
+    "beş": 5, "bes": 5, "altı": 6, "alti": 6, "yedi": 7, "sekiz": 8, "dokuz": 9, "on": 10,
+    "yirmi": 20, "otuz": 30,
+}
+for _tens_word, _tens_value in (("on", 10), ("yirmi", 20), ("otuz", 30)):
+    for _unit_word, _unit_value in list(_TR_NUM_WORDS.items()):
+        if 1 <= _unit_value <= 9 and " " not in _unit_word:
+            _TR_NUM_WORDS[f"{_tens_word} {_unit_word}"] = _tens_value + _unit_value
+
+
+def _word_unit_pattern(words: Dict[str, int], units: str) -> re.Pattern:
+    alternatives = "|".join(re.escape(word) for word in sorted(words, key=len, reverse=True))
+    return re.compile(rf"(?<![A-Za-zÀ-ž])({alternatives})\s+(?:{units})(?![A-Za-zÀ-ž])", re.IGNORECASE)
+
+
+LOCALIZED_WORD_UNIT_PATTERNS = [
+    (_word_unit_pattern(_ID_NUM_WORDS, r"hari|jam|menit|detik|tingkat|level|kali|bulan"), _ID_NUM_WORDS),
+    (_word_unit_pattern(_IT_NUM_WORDS, r"giorni?|ore?|minuti?|secondi?|livelli?|volte?|mesi?"), _IT_NUM_WORDS),
+    (_word_unit_pattern(_TR_NUM_WORDS, r"gün|gun|saat|dakika|saniye|seviye|kez|defa|ay"), _TR_NUM_WORDS),
+]
+
+LOCALIZED_MONTH_NAMES = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6, "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+    "januari": 1, "februari": 2, "maret": 3, "april": 4, "mei": 5, "juni": 6, "juli": 7, "agustus": 8, "september": 9, "oktober": 10, "november": 11, "desember": 12,
+    "gennaio": 1, "febbraio": 2, "marzo": 3, "aprile": 4, "maggio": 5, "giugno": 6, "luglio": 7, "agosto": 8, "settembre": 9, "ottobre": 10, "novembre": 11, "dicembre": 12,
+    "ocak": 1, "şubat": 2, "subat": 2, "mart": 3, "nisan": 4, "mayıs": 5, "mayis": 5, "haziran": 6, "temmuz": 7, "ağustos": 8, "agustos": 8, "eylül": 9, "eylul": 9, "ekim": 10, "kasım": 11, "kasim": 11, "aralık": 12, "aralik": 12,
+}
+LOCALIZED_MONTH_RE = re.compile(
+    r"(?<![A-Za-zÀ-ž])(" + "|".join(re.escape(word) for word in sorted(LOCALIZED_MONTH_NAMES, key=len, reverse=True)) + r")(?![A-Za-zÀ-ž])",
+    re.IGNORECASE,
+)
 
 def _cn_number_to_int(text: str) -> int | None:
     raw = (text or "").strip()
@@ -1923,18 +2163,50 @@ def _consume_regex_tokens(value: str, regex: re.Pattern, token_func) -> Tuple[st
     return "".join(chars), tokens
 
 
+def _consume_localized_word_numbers(value: str) -> Tuple[str, List[Tuple[int, str]]]:
+    tokens: List[Tuple[int, str]] = []
+    working = value
+    for regex, mapping in LOCALIZED_WORD_UNIT_PATTERNS:
+        chars = list(working)
+        normalized_mapping = {word.casefold(): number for word, number in mapping.items()}
+        for match in regex.finditer(working):
+            key = re.sub(r"\s+", " ", match.group(1).strip()).casefold()
+            if key not in normalized_mapping:
+                continue
+            tokens.append((match.start(), str(normalized_mapping[key])))
+            for idx in range(match.start(), match.end()):
+                chars[idx] = " "
+        working = "".join(chars)
+    return working, tokens
+
+
+def _consume_localized_months(value: str) -> Tuple[str, List[Tuple[int, str]]]:
+    chars = list(value)
+    tokens: List[Tuple[int, str]] = []
+    month_mapping = {word.casefold(): month for word, month in LOCALIZED_MONTH_NAMES.items()}
+    for match in LOCALIZED_MONTH_RE.finditer(value):
+        month = month_mapping.get(match.group(1).casefold())
+        if month is None:
+            continue
+        tokens.append((match.start(), f"month:{month:02d}"))
+        for idx in range(match.start(), match.end()):
+            chars[idx] = " "
+    return "".join(chars), tokens
+
+
 def _mask_natural_quantity_words(value: str) -> str:
     """屏蔽自然语言数量词，避免把“一个/a/an/once”等当强配置数值。"""
     value = LIST_PREFIX_RE.sub(" ", value)
     value = CN_NATURAL_ONE_RE.sub(" ", value)
     value = CN_NATURAL_ARABIC_ONE_RE.sub(" ", value)
     value = EN_NATURAL_QUANTITY_RE.sub(" ", value)
+    value = CN_LEXICAL_NUMBER_RE.sub(" ", value)
     # a/an/one/single/once/each/every 默认不是强业务数值；如需严格检查可后续做成 UI 开关。
     value = EN_NATURAL_ONE_RE.sub(" ", value)
     return value
 
 
-def extract_business_numbers(text: str, include_ascii_roman: bool = False) -> List[str]:
+def extract_business_numbers(text: str, include_ascii_roman: bool = False, include_localized_months: bool = False) -> List[str]:
     value = "" if text is None else str(text)
     tokens: List[Tuple[int, str]] = []
 
@@ -1952,6 +2224,25 @@ def extract_business_numbers(text: str, include_ascii_roman: bool = False) -> Li
             _cn_number_to_int(m.group(2)) or int(m.group(2)),
         ),
     )
+    tokens.extend(found)
+    if include_localized_months:
+        value, found = _consume_regex_tokens(
+            value,
+            CN_MONTH_RE,
+            lambda m: f"month:{(_cn_number_to_int(m.group(1)) if _cn_number_to_int(m.group(1)) is not None else int(m.group(1))):02d}",
+        )
+        tokens.extend(found)
+        value, found = _consume_localized_months(value)
+        tokens.extend(found)
+    value, found = _consume_regex_tokens(
+        value,
+        CN_MONTH_DURATION_RE,
+        lambda m: str(_cn_number_to_int(m.group(1)) if _cn_number_to_int(m.group(1)) is not None else m.group(1)),
+    )
+    tokens.extend(found)
+    value, found = _consume_regex_tokens(value, ID_ONE_MONTH_RE, lambda _m: "1")
+    tokens.extend(found)
+    value, found = _consume_regex_tokens(value, IT_ONE_MONTH_RE, lambda _m: "1")
     tokens.extend(found)
     value, found = _consume_regex_tokens(value, TIME_RE, lambda m: str(int(m.group(1))) if m.group(2) == "00" else f"{int(m.group(1))}:{m.group(2)}")
     tokens.extend(found)
@@ -1982,9 +2273,19 @@ def extract_business_numbers(text: str, include_ascii_roman: bool = False) -> Li
     if include_ascii_roman:
         value, found = _consume_regex_tokens(value, ASCII_ROMAN_RE, lambda m: str(_ROMAN_NUM.get(m.group(1).upper(), m.group(1))))
         tokens.extend(found)
+    value, found = _consume_regex_tokens(
+        value,
+        CN_APPROX_RANGE_RE,
+        lambda m: f"{_cn_number_to_int(m.group(1))}|{_cn_number_to_int(m.group(2))}",
+    )
+    for pos, pair in found:
+        left, right = pair.split("|", 1)
+        tokens.extend([(pos, left), (pos + 1, right)])
     value, found = _consume_regex_tokens(value, CN_STRONG_NUMBER_UNIT_RE, lambda m: str(_cn_number_to_int(m.group(1)) if _cn_number_to_int(m.group(1)) is not None else m.group(1)))
     tokens.extend(found)
     value, found = _consume_regex_tokens(value, EN_STRONG_WORD_NUMBER_RE, lambda m: str(_EN_NUM.get(re.match(r"[A-Za-z]+", m.group(0)).group(0).lower(), re.match(r"[A-Za-z]+", m.group(0)).group(0).lower())))
+    tokens.extend(found)
+    value, found = _consume_localized_word_numbers(value)
     tokens.extend(found)
     # 保留旧规则兜底，但前面已经屏蔽 one/a/once 这类自然数量词。
     value, found = _consume_regex_tokens(value, EN_WORD_NUMBER_RE, lambda m: str(_EN_NUM.get((m.group(1) or re.match(r"[A-Za-z]+", m.group(0)).group(0)).lower(), (m.group(1) or m.group(0)).lower())))
@@ -2080,6 +2381,15 @@ def _plausible_excel_serials(values: Sequence[str]) -> bool:
         return False
 
 
+def _has_localized_word_quantity(text: str) -> bool:
+    value = "" if text is None else str(text)
+    return bool(
+        any(regex.search(value) for regex, _mapping in LOCALIZED_WORD_UNIT_PATTERNS)
+        or ID_ONE_MONTH_RE.search(value)
+        or IT_ONE_MONTH_RE.search(value)
+    )
+
+
 def _number_consistency_error(source_text: str, current_text: str) -> Tuple[str, str, str, bool]:
     source_percent_values = _suffix_or_word_percent_values(source_text)
     current_percent_values = _suffix_or_word_percent_values(current_text)
@@ -2096,8 +2406,17 @@ def _number_consistency_error(source_text: str, current_text: str) -> Tuple[str,
     source_for_numbers = normalize_prefix_percent(source_text, current_percent_values)
     current_for_numbers = normalize_prefix_percent(current_text, source_percent_values)
     include_ascii_roman = bool(ROMAN_NUMERAL_RE.search(source_text or "") or ROMAN_NUMERAL_RE.search(current_text or ""))
-    source_numbers = extract_business_numbers(source_for_numbers, include_ascii_roman=include_ascii_roman)
-    current_numbers = extract_business_numbers(current_for_numbers, include_ascii_roman=include_ascii_roman)
+    include_localized_months = bool(CN_MONTH_RE.search(source_text or "") or CN_MONTH_RE.search(current_text or ""))
+    source_numbers = extract_business_numbers(
+        source_for_numbers,
+        include_ascii_roman=include_ascii_roman,
+        include_localized_months=include_localized_months,
+    )
+    current_numbers = extract_business_numbers(
+        current_for_numbers,
+        include_ascii_roman=include_ascii_roman,
+        include_localized_months=include_localized_months,
+    )
     if not source_numbers and not current_numbers:
         return "", "", "", False
     if _date_tokens_equivalent(source_numbers, current_numbers):
@@ -2107,6 +2426,8 @@ def _number_consistency_error(source_text: str, current_text: str) -> Tuple[str,
     if Counter(source_canonical) == Counter(current_canonical):
         # 等级前缀和跨语言语序均属于正常本地化表现。
         return "", "", "", False
+    if _has_localized_word_quantity(source_text) or _has_localized_word_quantity(current_text) or CN_APPROX_RANGE_RE.search(source_text or ""):
+        return "数值本地化转换待确认", "需人工确认", f"检测到数字单词、月份时长或近似数量表达；标准化后仍存在差异：源={_number_list_text(source_numbers)}；译文={_number_list_text(current_numbers)}", True
     if (_has_date_context(source_text) or _has_date_context(current_text)) and (
         _plausible_excel_serials(source_canonical) or _plausible_excel_serials(current_canonical)
     ):
@@ -2134,7 +2455,7 @@ def _rich_tag_items(text: str) -> List[Tuple[int, str, str, str]]:
             continue
         if slash and attrs.strip():
             continue
-        if name in {"b", "i", "u", "br"} and attrs.strip():
+        if name in {"b", "i", "u", "e", "br"} and attrs.strip():
             continue
         kind = "self" if self_close or name in SELF_CLOSING_TAG_NAMES else ("close" if slash else "open")
         items.append((match.start(), kind, name, attrs.strip()))
@@ -2153,7 +2474,7 @@ def _rich_tag_items(text: str) -> List[Tuple[int, str, str, str]]:
         # truncated to an [i] tag with a fake attribute named "Scream".
         if slash and param.strip():
             continue
-        if name in {"b", "i", "u", "br"} and param.strip():
+        if name in {"b", "i", "u", "e", "br"} and param.strip():
             continue
         if name in {"url", "link"} and param.strip() and "=" not in raw_tag:
             continue
@@ -2185,8 +2506,8 @@ def _normalize_tag_attrs(attrs: str) -> str:
 
 
 LONG_TAG_START_RE = re.compile(r"[\[<]\s*/?\s*(?:color|size|font|url|ref|link)\b", re.IGNORECASE)
-SHORT_TAG_START_RE = re.compile(r"[\[<]\s*/?\s*(?:b|i|u|br)\s*(?=[\]>])", re.IGNORECASE)
-INCOMPLETE_SHORT_TAG_RE = re.compile(r"[\[<]\s*/?\s*(?:b|i|u|br)\s*(?=$|[\r\n])", re.IGNORECASE)
+SHORT_TAG_START_RE = re.compile(r"[\[<]\s*/?\s*(?:b|i|u|e|br)\s*(?=[\]>])", re.IGNORECASE)
+INCOMPLETE_SHORT_TAG_RE = re.compile(r"[\[<]\s*/?\s*(?:b|i|u|e|br)\s*(?=$|[\r\n])", re.IGNORECASE)
 
 
 def _tag_bracket_error(text: str) -> str:
@@ -2340,6 +2661,34 @@ def _empty(text: str) -> bool:
     return not INVISIBLE_TEXT_RE.sub("", "" if text is None else str(text))
 
 
+def _row_type_matches(row_type: str, configured: str) -> bool:
+    normalized = _normalize_column_key(row_type)
+    if not normalized:
+        return False
+    for candidate in _split_config_values(configured):
+        candidate_norm = _normalize_column_key(candidate)
+        if candidate_norm and (normalized == candidate_norm or candidate_norm in normalized):
+            return True
+    return False
+
+
+def _row_requires_source_text(
+    record: LocalizationRow,
+    target_columns: Sequence[LocalizationColumn],
+    reference_text: str,
+    options: LocalizationCheckOptions,
+) -> bool:
+    if any(not _empty(record.values.get(column.index, "")) for column in target_columns):
+        return True
+    if not _empty(reference_text):
+        return True
+    if _row_type_matches(record.row_type, options.non_text_row_types_text):
+        return False
+    if _row_type_matches(record.row_type, options.text_row_types_text):
+        return True
+    return False
+
+
 def _infer_issue_level(issue_type: str, explicit: str = "") -> str:
     if explicit:
         return explicit
@@ -2369,6 +2718,8 @@ def _issue_confidence(level: str) -> str:
 
 
 def _result_category(level: str, issue_type: str, rule_name: str = "") -> str:
+    if rule_name == "译文重复" or issue_type == "不同源文本译文重复":
+        return "译文复用分析"
     if level == "源文本问题" or "源文本" in issue_type:
         return "源文本问题"
     if level == "语言覆盖范围" or rule_name == "整列空翻译":
@@ -2380,7 +2731,7 @@ def _result_category(level: str, issue_type: str, rule_name: str = "") -> str:
     return "明确问题"
 
 
-def _make_issue(index: int, issue_type: str, text_id: str, language: str, row_number: int | str, source_text: str, current_text: str, remark: str, suggestion: str, sheet_name: str = "", issue_level: str = "", rule_name: str = "", source_language: str = "", is_false_positive: bool = False, module: str = "", source_file: str = "", target_file: str = "", result_category: str = "", count_in_error_stats: bool | None = None, affected_languages: str = "", coverage_total: int = 0, coverage_filled: int = 0, coverage_blank: int = 0, coverage_status: str = "") -> LocalizationIssue:
+def _make_issue(index: int, issue_type: str, text_id: str, language: str, row_number: int | str, source_text: str, current_text: str, remark: str, suggestion: str, sheet_name: str = "", issue_level: str = "", rule_name: str = "", source_language: str = "", is_false_positive: bool = False, module: str = "", source_file: str = "", target_file: str = "", result_category: str = "", count_in_error_stats: bool | None = None, affected_languages: str = "", coverage_total: int = 0, coverage_filled: int = 0, coverage_blank: int = 0, coverage_status: str = "", row_type: str = "") -> LocalizationIssue:
     level = _infer_issue_level(issue_type, issue_level)
     manual_confirm = _issue_requires_manual_confirm(level, issue_type)
     category = result_category or _result_category(level, issue_type, rule_name)
@@ -2416,6 +2767,7 @@ def _make_issue(index: int, issue_type: str, text_id: str, language: str, row_nu
         coverage_filled=max(0, int(coverage_filled or 0)),
         coverage_blank=max(0, int(coverage_blank or 0)),
         coverage_status="" if coverage_status is None else str(coverage_status),
+        row_type="" if row_type is None else str(row_type),
     )
 
 
@@ -2620,6 +2972,7 @@ def _check_single_table_quality(
 
     issues: List[LocalizationIssue] = []
     index = 1
+    affected_language_names = "、".join(_localization_column_label(column) for column in target_columns)
 
     for diag in table.diagnostics:
         if "记录数为 0" in diag or "语言列较少" in diag:
@@ -2627,8 +2980,31 @@ def _check_single_table_quality(
             index += 1
 
     if options.check_invalid_id:
-        for row_number in table.invalid_rows:
-            issues.append(_make_issue(index, "无效 ID", "", "", row_number, "", "", "主键 ID 为空但该行存在内容", "补充 ID 或删除无效行", table.sheet_name, "普通问题", "主键", source_language))
+        invalid_records = table.invalid_row_records or [LocalizationRow("", row_number, {}) for row_number in table.invalid_rows]
+        for invalid_record in invalid_records:
+            invalid_source = invalid_record.values.get(source_col, "")
+            invalid_targets = [invalid_record.values.get(column.index, "") for column in target_columns]
+            if invalid_record.values and _empty(invalid_source) and not any(not _empty(value) for value in invalid_targets):
+                continue
+            current_preview = "；".join(value for value in invalid_targets if not _empty(value))[:1000]
+            issues.append(_make_issue(
+                index,
+                "无效 ID",
+                "",
+                "",
+                invalid_record.row_number,
+                invalid_source,
+                current_preview,
+                "主键 ID 为空，但该行存在正式源文本或已选目标语言翻译内容",
+                "补充 ID，或确认该行是否应从正式翻译数据区移除",
+                table.sheet_name,
+                "普通问题",
+                "主键",
+                source_language,
+                affected_languages=affected_language_names,
+                row_type=invalid_record.row_type,
+                module=invalid_record.row_type,
+            ))
             index += 1
 
     if options.check_duplicate_id:
@@ -2678,23 +3054,33 @@ def _check_single_table_quality(
             continue
         source_text = record.values.get(source_col, "")
         if options.check_empty and _empty(source_text):
-            issues.append(_make_issue(
-                index,
-                f"{source_language}源文本为空",
-                text_id,
-                source_language,
-                record.row_number,
-                source_text,
-                source_text,
-                f"ID 已存在，但 {source_language} 源文本为空或仅包含空格/换行/不可见字符",
-                "先补充或确认源语言文本，再进行目标语言质量比对",
-                table.sheet_name,
-                "源文本问题",
-                "源文本空文本",
-                source_language,
-            ))
-            index += 1
+            reference_text = record.values.get(english_col, "") if english_col >= 0 and english_col != source_col else ""
+            if _row_requires_source_text(record, target_columns, reference_text, options):
+                issues.append(_make_issue(
+                    index,
+                    f"{source_language}源文本为空",
+                    text_id,
+                    source_language,
+                    record.row_number,
+                    source_text,
+                    source_text,
+                    f"ID 已存在，但 {source_language} 源文本为空；该行存在目标/参考语言文本，或行类型属于明确文本类型",
+                    "补充或确认源语言文本；非文本控制行可通过行类型配置排除",
+                    table.sheet_name,
+                    "源文本问题",
+                    "源文本空文本",
+                    source_language,
+                    result_category="源文本问题",
+                    count_in_error_stats=False,
+                    affected_languages=affected_language_names,
+                    row_type=record.row_type,
+                    module=record.row_type,
+                ))
+                index += 1
             continue
+        source_metadata = record.cell_metadata.get(source_col)
+        source_newline_invalid = bool(_reversed_newline_marker(source_text))
+        source_cell_format_invalid = _suspected_excel_auto_date(source_metadata)
         index = _add_source_self_format_issues(
             issues,
             index,
@@ -2704,6 +3090,9 @@ def _check_single_table_quality(
             row_number=record.row_number,
             source_text=source_text,
             options=options,
+            metadata=source_metadata,
+            affected_languages=affected_language_names,
+            row_type=record.row_type,
         )
         source_tag_invalid = bool(options.check_tags and TAG_SIGNAL_RE.search(source_text or "") and _tag_error(source_text))
         english_text = record.values.get(english_col, "") if english_col >= 0 else ""
@@ -2729,6 +3118,9 @@ def _check_single_table_quality(
                 options=options,
                 enable_layout_heuristics=game_text_mode,
                 source_tag_invalid=source_tag_invalid,
+                source_newline_invalid=source_newline_invalid,
+                source_cell_format_invalid=source_cell_format_invalid,
+                row_type=record.row_type,
             )
             if game_text_mode and options.check_terms and english_text:
                 index = _add_english_copy_issue(
@@ -2823,8 +3215,16 @@ def _check_multi_table_sheets_quality(
                     ws.reset_dimensions()
                 except Exception:
                     pass
-                rows = _worksheet_rows_as_text(ws)
-                table = _localization_table_from_rows(local_options, path, rows, sheet_name, [f"批量模式选择 Sheet：{sheet_name}（评分 {score}，{reason}）"])
+                cell_metadata: Dict[Tuple[int, int], LocalizationCellMetadata] = {}
+                rows = _worksheet_rows_as_text(ws, metadata=cell_metadata)
+                table = _localization_table_from_rows(
+                    local_options,
+                    path,
+                    rows,
+                    sheet_name,
+                    [f"批量模式选择 Sheet：{sheet_name}（评分 {score}，{reason}）"],
+                    cell_metadata,
+                )
                 columns = detect_language_columns(table.headers, table.key_col_index, table.display_headers, table.type_headers)
                 _emit_progress(
                     progress_callback,
@@ -3151,6 +3551,20 @@ def _newline_marker_count(text: str) -> int:
     return escaped + actual
 
 
+REVERSED_NEWLINE_RE = re.compile(r"(?:^|[\s（(])(?:n/|/n)(?=\S)", re.IGNORECASE)
+
+
+def _reversed_newline_marker(text: str) -> str:
+    match = REVERSED_NEWLINE_RE.search("" if text is None else str(text))
+    return match.group(0).strip() if match else ""
+
+
+def _suspected_excel_auto_date(metadata: LocalizationCellMetadata | None) -> bool:
+    if metadata is None or metadata.raw_value is None or not metadata.is_date:
+        return False
+    return _date_format_without_year(metadata.number_format)
+
+
 def _visible_text_length(text: str) -> int:
     value = "" if text is None else str(text)
     for regex in (
@@ -3189,16 +3603,28 @@ def _text_truncation_risk(language: str, source_text: str, current_text: str) ->
     return False, ""
 
 
-def _add_text_quality_issues(issues: List[LocalizationIssue], index: int, *, text_id: str, language: str, sheet_name: str, row_number: int | str, source_text: str, current_text: str, source_language: str, allowed_chinese: set[str], symbols: Sequence[str], options: LocalizationCheckOptions, enable_layout_heuristics: bool = False, source_tag_invalid: bool = False) -> int:
+def _annotate_issue_context(issues: List[LocalizationIssue], start_index: int, row_type: str) -> None:
+    for item in issues[start_index:]:
+        if not item.row_type:
+            item.row_type = row_type
+        if not item.module:
+            item.module = row_type
+
+
+def _add_text_quality_issues(issues: List[LocalizationIssue], index: int, *, text_id: str, language: str, sheet_name: str, row_number: int | str, source_text: str, current_text: str, source_language: str, allowed_chinese: set[str], symbols: Sequence[str], options: LocalizationCheckOptions, enable_layout_heuristics: bool = False, source_tag_invalid: bool = False, source_newline_invalid: bool = False, source_cell_format_invalid: bool = False, row_type: str = "") -> int:
+    issue_start = len(issues)
     if options.check_empty and _empty(current_text):
         if not options.empty_requires_source_text or str(source_text or "").strip():
             issues.append(_make_issue(index, "空翻译", text_id, language, row_number, source_text, current_text, f"{language} 翻译为空", f"补充 {language} 翻译文本，或确认该 ID 是否允许为空", sheet_name, "高风险错误", "空翻译", source_language))
+            _annotate_issue_context(issues, issue_start, row_type)
             return index + 1
+        _annotate_issue_context(issues, issue_start, row_type)
         return index
 
-    unfinished_marker = _contains_unfinished_marker(current_text) if options.check_unfinished else ""
+    unfinished_marker = _contains_unfinished_marker(current_text, options.unfinished_markers_text) if options.check_unfinished else ""
     if unfinished_marker:
         issues.append(_make_issue(index, "未完成/修改中占位文本", text_id, language, row_number, source_text, current_text, f"命中未完成占位文本：{unfinished_marker}", "补齐正式翻译；命中后已跳过数值、标签、占位符等派生检查，避免重复噪音", sheet_name, "高风险错误", "未完成占位文本", source_language))
+        _annotate_issue_context(issues, issue_start, row_type)
         return index + 1
 
     if options.check_chinese and not _is_allowed_chinese_language(language, allowed_chinese) and CHINESE_RE.search(current_text or ""):
@@ -3244,7 +3670,7 @@ def _add_text_quality_issues(issues: List[LocalizationIssue], index: int, *, tex
                 issues.append(_make_issue(index, tag_issue_type, text_id, language, row_number, source_text, current_text, remark, suggestion, sheet_name, level, "标签", source_language, suspected))
                 index += 1
 
-    if options.check_symbols:
+    if options.check_symbols and not source_newline_invalid:
         source_newlines = _newline_marker_count(source_text)
         current_newlines = _newline_marker_count(current_text)
         if source_newlines != current_newlines:
@@ -3256,7 +3682,7 @@ def _add_text_quality_issues(issues: List[LocalizationIssue], index: int, *, tex
             issues.append(_make_issue(index, "特殊符号差异待确认", text_id, language, row_number, source_text, current_text, f"上下文结构中的符号存在差异：{', '.join(missing)}", "人工确认该符号是否属于 URL、路径、比例、日期或配置表达式", sheet_name, "需人工确认", "特殊符号上下文", source_language, True))
             index += 1
 
-    if options.check_numbers and (NUMBER_SIGNAL_RE.search(source_text or "") or NUMBER_SIGNAL_RE.search(current_text or "")):
+    if options.check_numbers and not source_cell_format_invalid and (NUMBER_SIGNAL_RE.search(source_text or "") or NUMBER_SIGNAL_RE.search(current_text or "")):
         number_issue_type, level, number_remark, suspected = _number_consistency_error(source_text, current_text)
         if number_issue_type:
             issues.append(_make_issue(index, number_issue_type, text_id, language, row_number, source_text, current_text, number_remark, "请确认译文中的业务数值是否与源文本一致", sheet_name, level, "数值", source_language, suspected))
@@ -3280,21 +3706,67 @@ def _add_text_quality_issues(issues: List[LocalizationIssue], index: int, *, tex
                 issues.append(_make_issue(index, "文本截断风险", text_id, language, row_number, source_text, current_text, truncation_reason, "人工确认目标语言在实际 UI 容器中是否会被截断", sheet_name, "疑似问题", "长度/截断风险", source_language, True))
                 index += 1
 
+    _annotate_issue_context(issues, issue_start, row_type)
     return index
 
 
-def _add_source_self_format_issues(issues: List[LocalizationIssue], index: int, *, text_id: str, language: str, sheet_name: str, row_number: int | str, source_text: str, options: LocalizationCheckOptions) -> int:
+def _add_source_self_format_issues(issues: List[LocalizationIssue], index: int, *, text_id: str, language: str, sheet_name: str, row_number: int | str, source_text: str, options: LocalizationCheckOptions, metadata: LocalizationCellMetadata | None = None, affected_languages: str = "", row_type: str = "") -> int:
+    issue_start = len(issues)
     source_label = _language_code_from_label(language) or language
     if options.check_placeholders and PLACEHOLDER_SIGNAL_RE.search(source_text or ""):
         issue_type, level, remark, suggestion, suspected = _malformed_placeholder_issue(source_text, target=False)
         if issue_type:
-            issues.append(_make_issue(index, f"{source_label} 源文本占位符结构异常", text_id, language, row_number, source_text, source_text, remark, suggestion, sheet_name, "源文本问题", "源文本占位符", language, suspected, result_category="源文本问题", count_in_error_stats=False))
+            issues.append(_make_issue(index, f"{source_label} 源文本占位符结构异常", text_id, language, row_number, source_text, source_text, remark, suggestion, sheet_name, "源文本问题", "源文本占位符", language, suspected, result_category="源文本问题", count_in_error_stats=False, affected_languages=affected_languages))
             index += 1
     if options.check_tags and TAG_SIGNAL_RE.search(source_text or ""):
         tag_error = _tag_error(source_text)
         if tag_error:
-            issues.append(_make_issue(index, f"{source_label} 源文本标签结构异常", text_id, language, row_number, source_text, source_text, tag_error, "先修正源文本富文本标签括号、嵌套和闭合关系，再同步翻译", sheet_name, "源文本问题", "源文本标签词法预检查", language, result_category="源文本问题", count_in_error_stats=False))
+            issues.append(_make_issue(index, f"{source_label} 源文本标签结构异常", text_id, language, row_number, source_text, source_text, tag_error, "先修正源文本富文本标签括号、嵌套和闭合关系，再同步翻译", sheet_name, "源文本问题", "源文本标签词法预检查", language, result_category="源文本问题", count_in_error_stats=False, affected_languages=affected_languages))
             index += 1
+    if options.check_symbols:
+        reversed_marker = _reversed_newline_marker(source_text)
+        if reversed_marker:
+            issues.append(_make_issue(
+                index,
+                "源文本换行格式符疑似写反",
+                text_id,
+                language,
+                row_number,
+                source_text,
+                source_text,
+                f"源文本检测到疑似写反的换行格式符：{reversed_marker}；应确认是否 intended 为 \\n",
+                "修正源文本格式符后再比较各目标语言换行结构",
+                sheet_name,
+                "源文本问题",
+                "源文本换行格式",
+                language,
+                result_category="源文本问题",
+                count_in_error_stats=False,
+                affected_languages=affected_languages,
+            ))
+            index += 1
+    if _suspected_excel_auto_date(metadata):
+        raw_value = metadata.raw_value.isoformat() if isinstance(metadata.raw_value, (date, datetime)) else str(metadata.raw_value)
+        issues.append(_make_issue(
+            index,
+            "源文本单元格格式异常",
+            text_id,
+            language,
+            row_number,
+            source_text,
+            source_text,
+            f"源单元格被 Excel 读取为日期；显示值={metadata.display_value}，原始值={raw_value}，数据类型={metadata.data_type}，number format={metadata.number_format}。疑似短横线章节编号被自动转换。",
+            "回到源表将该单元格设置为文本格式并核对原始章节编号",
+            sheet_name,
+            "源文本问题",
+            "Excel 单元格格式",
+            language,
+            result_category="源文本问题",
+            count_in_error_stats=False,
+            affected_languages=affected_languages,
+        ))
+        index += 1
+    _annotate_issue_context(issues, issue_start, row_type)
     return index
 
 
@@ -3663,14 +4135,14 @@ def _reindex(issues: Iterable[LocalizationIssue]) -> List[LocalizationIssue]:
 
 
 def localization_issues_to_tsv(issues: Iterable[LocalizationIssue]) -> str:
-    headers = ["序号", "问题等级", "问题类型", "ID", "源语言列", "目标语言列", "Sheet", "行号", "源文本", "当前文本", "命中规则", "问题说明", "建议处理", "是否人工确认项", "是否计入错误统计", "规则置信度", "所属模块", "源文件", "目标文件"]
+    headers = ["序号", "问题等级", "问题类型", "ID", "源语言列", "目标语言列", "Sheet", "行号", "源文本", "当前文本", "命中规则", "问题说明", "建议处理", "是否人工确认项", "是否计入错误统计", "规则置信度", "所属模块", "源文件", "目标文件", "行类型"]
     rows = ["\t".join(headers)]
     for item in issues:
         rows.append("\t".join([
             str(item.index), item.issue_level, item.issue_type, _format_identifier(item.item_id), item.source_language, item.language, item.sheet_name, item.row_number,
             item.source_text.replace("\n", "\\n"), item.current_text.replace("\n", "\\n"), item.rule_name, item.remark, item.suggestion,
             "是" if item.requires_manual_confirm else "否", "是" if item.count_in_error_stats else "否", item.rule_confidence,
-            item.module, item.source_file, item.target_file,
+            item.module, item.source_file, item.target_file, item.row_type,
         ]))
     return "\n".join(rows)
 
@@ -3804,15 +4276,21 @@ def export_localization_issues_to_excel(issues: Iterable[LocalizationIssue], out
     source_items = category_groups.get("源文本问题", [])
     manual_items = category_groups.get("需人工确认", [])
     coverage_items = category_groups.get("语言覆盖范围", [])
+    reuse_items = category_groups.get("译文复用分析", [])
     ignored_items = category_groups.get("忽略项或白名单", [])
     error_total = sum(1 for item in clear_items if item.count_in_error_stats)
+    checked_languages = sorted({item.language for item in coverage_items if item.language})
+    source_languages = sorted({item.source_language for item in items if item.source_language})
     for row in [
         ["全部检查记录", len(items)],
         ["错误总数（高置信度明确问题）", error_total],
+        ["本次源语言范围", "、".join(source_languages) or "未记录"],
+        ["本次实际检查语言范围", "、".join(checked_languages) or "未记录"],
         ["明确问题", len(clear_items)],
         ["源文本问题", len(source_items)],
         ["需人工确认", len(manual_items)],
         ["语言覆盖记录", len(coverage_items)],
+        ["译文复用分析", len(reuse_items)],
         ["忽略项或白名单命中", len(ignored_items)],
         ["不计入错误统计数", sum(1 for item in items if not item.count_in_error_stats)],
         ["明确问题类型", "；".join(f"{k}={v}" for k, v in Counter(item.issue_type for item in clear_items).most_common())],
@@ -3820,19 +4298,19 @@ def export_localization_issues_to_excel(issues: Iterable[LocalizationIssue], out
         ["统计口径", "错误总数只统计明确问题且是否计入错误统计=是；源文本、人工确认、语言覆盖、白名单不计入目标语言错误总数。"],
     ]:
         append_safe_row(ws, row)
-    finish_sheet(ws, 2, 12)
+    finish_sheet(ws, 2, 15)
 
-    detail_headers = ["序号", "结果分类", "Sheet 名称", "Excel 行号", "主键 ID", "源语言列", "目标语言列", "受影响语言", "源文本", "目标文本", "问题类型", "问题等级", "命中规则", "具体差异/命中原因", "处理建议", "是否人工确认项", "是否计入错误统计", "规则置信度", "所属模块", "源文件", "目标文件"]
-    detail_widths = [8, 16, 20, 12, 20, 14, 14, 24, 46, 46, 20, 14, 20, 50, 40, 14, 16, 12, 22, 28, 28]
+    detail_headers = ["序号", "结果分类", "Sheet 名称", "Excel 行号", "主键 ID", "源语言列", "目标语言列", "受影响语言", "源文本", "目标文本", "问题类型", "问题等级", "命中规则", "具体差异/命中原因", "处理建议", "是否人工确认项", "是否计入错误统计", "规则置信度", "行类型", "所属模块", "源文件", "目标文件"]
+    detail_widths = [8, 16, 20, 12, 20, 14, 14, 24, 46, 46, 20, 14, 20, 50, 40, 14, 16, 12, 18, 22, 28, 28]
 
     def issue_row(item: LocalizationIssue):
         group_key = (item.sheet_name, item.row_number, _format_identifier(item.item_id), item.issue_type, item.rule_name, item.remark)
-        affected = "、".join(sorted(grouped_languages.get(group_key, set()))) or item.affected_languages or item.language
+        affected = item.affected_languages or "、".join(sorted(grouped_languages.get(group_key, set()))) or item.language
         return [
             item.index, item.result_category, item.sheet_name, item.row_number, _format_identifier(item.item_id), item.source_language, item.language,
             safe_text(affected), safe_text(item.source_text), safe_text(item.current_text), item.issue_type, item.issue_level,
             item.rule_name, safe_text(item.remark), safe_text(item.suggestion), "是" if item.requires_manual_confirm else "否",
-            "是" if item.count_in_error_stats else "否", item.rule_confidence,
+            "是" if item.count_in_error_stats else "否", item.rule_confidence, item.row_type,
             safe_text(item.module), safe_text(item.source_file), safe_text(item.target_file),
         ]
 
@@ -3847,6 +4325,7 @@ def export_localization_issues_to_excel(issues: Iterable[LocalizationIssue], out
     write_issue_sheet("明确问题", clear_items)
     write_issue_sheet("源文本问题", source_items)
     write_issue_sheet("需人工确认", manual_items)
+    write_issue_sheet("译文复用分析", reuse_items)
 
     # 语言覆盖范围使用适合项目管理查看的独立字段。
     ws = wb.create_sheet("语言覆盖范围")

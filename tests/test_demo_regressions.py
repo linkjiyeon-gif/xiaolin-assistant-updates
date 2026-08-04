@@ -153,6 +153,15 @@ class DemoRegressionTests(unittest.TestCase):
                     ))
                     for row in expected_rows
                     if str(row[8] or "") != "数值顺序变化"
+                    # Confirmed historical false positives: lowercase natural-language
+                    # words such as Spanish/Portuguese ``todo`` are not TODO markers.
+                    and not (
+                        str(row[8] or "") == "未完成/修改中占位文本"
+                        and str(row[11] or "").endswith("：todo")
+                    )
+                    # Translation reuse is now an opt-in low-confidence analysis and
+                    # therefore is intentionally absent from the default result set.
+                    and str(row[8] or "") != "不同源文本译文重复"
                 }
                 actual = {
                     normalize_historical_issue((
@@ -169,7 +178,16 @@ class DemoRegressionTests(unittest.TestCase):
                 }
                 self.assertEqual(expected, actual)
                 self.assertEqual(
-                    collections.Counter(row[8] for row in expected_rows if str(row[8] or "") != "数值顺序变化"),
+                    collections.Counter(
+                        row[8]
+                        for row in expected_rows
+                        if str(row[8] or "") != "数值顺序变化"
+                        and not (
+                            str(row[8] or "") == "未完成/修改中占位文本"
+                            and str(row[11] or "").endswith("：todo")
+                        )
+                        and str(row[8] or "") != "不同源文本译文重复"
+                    ),
                     collections.Counter(
                         item.issue_type
                         for item in issues

@@ -58,6 +58,7 @@ from app.localization_checker import (
     localization_issues_to_tsv,
     export_localization_issues_to_excel,
     build_single_sheet_preview,
+    recommend_target_languages_from_filename,
 )
 from app.localization_sheet_parser import (
     MULTI_FILE_DICTIONARY_STRUCTURE,
@@ -1040,6 +1041,9 @@ class XiaoXinAssistant(ctk.CTk):
         self.loc_symbols_var = tk.StringVar(value="%, :, ：, +, -, /, \\, (), [], {}, \\n")
         self.loc_max_length_var = tk.StringVar(value="0")
         self.loc_length_ratio_var = tk.StringVar(value="0")
+        self.loc_text_row_types_var = tk.StringVar(value="对白,说话,旁白,文本,标题,选项,按钮,提示,名字,名称,字幕,描述,转场文字")
+        self.loc_non_text_row_types_var = tk.StringVar(value="转场动画,跳转,切换场景,模型出现,模型消失,玩法,镜头效果,关卡结束,分支节点")
+        self.loc_unfinished_markers_var = tk.StringVar(value="TODO,TBD,FIXME,翻译未完成,翻譯未完成,翻译错误，修改中,翻譯錯誤，修改中,待翻译,待翻譯,未翻译,未翻譯,untranslated,need translation,needs translation")
         self.loc_search_var = tk.StringVar(value="")
         self.loc_summary_var = tk.StringVar(value="请选择翻译文件后开始检查")
         self.loc_progress_var = tk.StringVar(value="等待开始")
@@ -1054,6 +1058,7 @@ class XiaoXinAssistant(ctk.CTk):
         self.loc_check_missing_id_var = tk.BooleanVar(value=True)
         self.loc_check_source_consistency_var = tk.BooleanVar(value=True)
         self.loc_check_numbers_var = tk.BooleanVar(value=True)
+        self.loc_check_duplicate_translation_var = tk.BooleanVar(value=False)
         self.loc_language_vars = {}
         self.loc_language_frame = None
         self.loc_rule_detail_frame = None
@@ -1063,6 +1068,8 @@ class XiaoXinAssistant(ctk.CTk):
         self.loc_detected_headers = []
         self.loc_multi_table_candidates_cache = []
         self.loc_multi_table_cache_key = None
+        self.loc_recommended_languages = []
+        self.loc_recommended_languages = []
         self.loc_all_issues = []
         self.loc_visible_issues = []
         self.loc_is_working = False
@@ -1256,6 +1263,14 @@ class XiaoXinAssistant(ctk.CTk):
                 self.iconphoto(True, self._window_icon_image)
             except Exception:
                 pass
+
+    def _set_dialog_icon(self, dialog):
+        try:
+            icon_path = get_icon_path("ico")
+            if os.path.exists(icon_path):
+                dialog.iconbitmap(icon_path)
+        except Exception:
+            pass
 
     def _ui_color(self, color_value):
         try:
@@ -6578,6 +6593,7 @@ class XiaoXinAssistant(ctk.CTk):
             ("重复 ID", self.loc_check_duplicate_id_var), ("无效 ID", self.loc_check_invalid_id_var),
             ("ID 缺失/多出", self.loc_check_missing_id_var), ("源文本一致", self.loc_check_source_consistency_var),
             ("数值一致", self.loc_check_numbers_var),
+            ("译文复用分析", self.loc_check_duplicate_translation_var),
         ]):
             ctk.CTkCheckBox(rule_top, text=text, variable=var, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13)).grid(row=idx // 4, column=idx % 4, sticky="w", padx=(0, 18), pady=5)
         self.loc_rules_toggle_button = ctk.CTkButton(rule_card, text="展开高级规则", width=130, height=32, corner_radius=12, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(12, "bold"), command=self._toggle_localization_rules)
@@ -6591,6 +6607,9 @@ class XiaoXinAssistant(ctk.CTk):
         self._small_entry(self.loc_rule_detail_frame, 1, 1, "最大字符数", self.loc_max_length_var, "0 = 不限制")
         self._small_entry(self.loc_rule_detail_frame, 2, 0, "源文长度倍率", self.loc_length_ratio_var, "0 = 不限制，例如 2")
         self._small_entry(self.loc_rule_detail_frame, 2, 1, "预期语言 Sheet", self.loc_expected_languages_var, "EN,DE,FR...；多 Sheet 模式用于检查缺失")
+        self._small_entry(self.loc_rule_detail_frame, 3, 0, "文本类行类型", self.loc_text_row_types_var, "逗号分隔；用于空源文判断")
+        self._small_entry(self.loc_rule_detail_frame, 3, 1, "非文本控制行类型", self.loc_non_text_row_types_var, "逗号分隔；源文和译文均空时忽略")
+        self._small_entry(self.loc_rule_detail_frame, 4, 0, "待翻译完整标记", self.loc_unfinished_markers_var, "TODO/TBD/FIXME 使用完整边界")
         self.loc_rule_detail_frame.grid_remove()
         self.loc_rules_visible = False
 
@@ -6603,7 +6622,8 @@ class XiaoXinAssistant(ctk.CTk):
 多 Sheet 语言页：支持 EN、DE、FR、JP 等语言分 Sheet 的表格，结果中会显示语言、Sheet 和行号。
 ID 缺失/多出：以 EN 优先作为基准，检查其他语言页是否缺少或多出 ID。
 源文本一致：检查同一 ID 在不同语言 Sheet 中的源文本是否一致。
-数值一致：检查源文本与译文中的业务数值是否一致，会忽略 {0}、%1$s、[value1]、富文本标签和颜色值中的数字。""")
+数值一致：检查源文本与译文中的业务数值是否一致，会忽略 {0}、%1$s、[value1]、富文本标签和颜色值中的数字。
+译文复用分析：默认关闭；开启后仅作为低置信度辅助信息，不计入错误总数。""")
 
         # 检查结果
         result_tab.grid_rowconfigure(1, weight=1)
@@ -6887,7 +6907,8 @@ ID 缺失/多出：以 EN 优先作为基准，检查其他语言页是否缺少
                 if hasattr(self, "loc_structure_preview_box"):
                     self._set_textbox_text(self.loc_structure_preview_box, "\n".join(preview_lines[:40]))
                 self.loc_file_status_var.set(f"识别成功：多 Sheet 翻译表 / Sheet {len(candidates)} 个 / 语言并集 {len(columns)} 个")
-                self.loc_summary_var.set("多 Sheet 翻译表识别完成，可开始批量检查")
+                recommendation = f"；已按文件名推荐 {', '.join(self.loc_recommended_languages)}，最终以勾选为准" if self.loc_recommended_languages else ""
+                self.loc_summary_var.set(f"多 Sheet 翻译表识别完成，可开始批量检查{recommendation}")
                 return
 
             if structure == MULTI_SHEET_STRUCTURE:
@@ -6925,7 +6946,8 @@ ID 缺失/多出：以 EN 优先作为基准，检查其他语言页是否缺少
             if hasattr(self, "loc_structure_preview_box"):
                 self._set_textbox_text(self.loc_structure_preview_box, build_single_sheet_preview(table, columns))
             self.loc_file_status_var.set(f"识别成功：Sheet={table.sheet_name} / {table.structure_type} / 表头第 {table.header_row} 行 / 数据第 {table.data_start_row} 行 / 记录 {len(table.records)} 条 / 语言列 {len(columns)} 个")
-            self.loc_summary_var.set("语言列识别完成，可开始检查")
+            recommendation = f"；已按文件名推荐 {', '.join(self.loc_recommended_languages)}，最终以勾选为准" if self.loc_recommended_languages else ""
+            self.loc_summary_var.set(f"语言列识别完成，可开始检查{recommendation}")
         except Exception as exc:
             messagebox.showerror("识别失败", str(exc))
 
@@ -6938,11 +6960,17 @@ ID 缺失/多出：以 EN 优先作为基准，检查其他语言页是否缺少
         if not columns:
             ctk.CTkLabel(self.loc_language_frame, text="尚未识别语言列。选择文件后点击“识别语言列”。", text_color=COLOR_MUTED, font=self._font(13)).grid(row=0, column=0, sticky="w", pady=4)
             return
+        recommended = recommend_target_languages_from_filename(self.loc_file_path_var.get().strip(), columns)
+        self.loc_recommended_languages = list(recommended)
+        recommended_set = set(recommended)
         for idx, col in enumerate(columns):
-            var = tk.BooleanVar(value=True)
+            code = str(getattr(col, "code", "") or getattr(col, "header", "") or "").upper()
+            var = tk.BooleanVar(value=(not recommended_set or code in recommended_set))
             self.loc_language_vars[col.header] = var
             text = col.name if col.name == col.header else f"{col.name}（{col.header}）"
             ctk.CTkCheckBox(self.loc_language_frame, text=text, variable=var, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(12)).grid(row=idx // 6, column=idx % 6, sticky="w", padx=(0, 8), pady=4)
+        if recommended:
+            self.loc_summary_var.set(f"已根据文件名推荐本次检查语言：{', '.join(recommended)}；最终范围以当前勾选为准")
 
     def _set_localization_languages(self, mode):
         for var in self.loc_language_vars.values():
@@ -6993,6 +7021,10 @@ ID 缺失/多出：以 EN 优先作为基准，检查其他语言页是否缺少
             check_missing_id=self.loc_check_missing_id_var.get(),
             check_source_consistency=self.loc_check_source_consistency_var.get(),
             check_numbers=self.loc_check_numbers_var.get(),
+            check_duplicate_translation=self.loc_check_duplicate_translation_var.get(),
+            text_row_types_text=self.loc_text_row_types_var.get(),
+            non_text_row_types_text=self.loc_non_text_row_types_var.get(),
+            unfinished_markers_text=self.loc_unfinished_markers_var.get(),
         )
         if (
             normalize_localization_mode(options.table_structure or "自动识别") == MULTI_TABLE_SHEETS_STRUCTURE
