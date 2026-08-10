@@ -1,4 +1,5 @@
 import ctypes
+from collections import deque
 from dataclasses import dataclass
 import heapq
 import ipaddress
@@ -159,6 +160,17 @@ def _ensure_pynput_loaded():
 DEFAULT_PKG_NAME = "com.tinywarsurvivalexpress.android"
 ADB_CMD_TIMEOUT = 10
 
+NETWORK_USAGE_GUIDE = """使用说明
+1. 权限准备：先点击左下角“管理员重启”，右上角显示“已就绪”后再使用。
+2. 选择范围：目标 IP 建议填写要测试的服务器 IP；留空会影响本机全部匹配流量，启动前会再次确认。
+3. 设置参数：协议和方向不确定时保持“全部”；延迟是单向延迟，抖动表示延迟上下浮动，丢包填 0～100。
+4. 进阶模拟：带宽填 0 表示不限速；突发丢包用于模拟连续断流；乱序默认关闭，仅在专项测试时开启。
+5. 快速开始：可先选择“弱网测试”或“移动网络”预设，再点击“开始模拟”。上下行同时生效时，额外 RTT 约为基础延迟的两倍。
+6. 查看与结束：运行中观察速度、丢包、队列和失败统计；测试完成后点击“停止模拟”，紧急情况可点“立即恢复网络”。
+示例：基础延迟 300ms、抖动 50ms，表示每个方向约延迟 250～350ms；上下行都生效时额外 RTT 通常约 600ms。
+注意：当前仅影响这台电脑以及通过电脑联网的模拟器流量，不支持非 Root 真机直连弱网；高级规则仅建议熟悉 WinDivert 的用户填写。
+"""
+
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
@@ -288,8 +300,31 @@ class ClickerWorker:
 
 
 # ---------------- Network Delay / Loss ----------------
+def ensure_windivert_impostor_guard(filter_text: str) -> str:
+    """Protect WinDivert rules from capturing reinjected packets again."""
+    cleaned = str(filter_text or "").strip() or "true"
+    compact = "".join(cleaned.lower().split())
+    if "!impostor" in compact or "notimpostor" in compact:
+        return cleaned
+    if cleaned.lower() == "true":
+        return "!impostor"
+    return f"(!impostor) and ({cleaned})"
+
+
 class NetworkWorker:
-    def __init__(self, log_callback, state_callback=None):
+    DEFAULT_MAX_QUEUE_PACKETS = 10000
+    DEFAULT_MAX_QUEUE_BYTES = 64 * 1024 * 1024
+    FLOW_STATE_TTL_SECONDS = 120.0
+    FLOW_CLEANUP_INTERVAL_SECONDS = 30.0
+    RATE_WINDOW_SECONDS = 1.0
+
+    def __init__(
+        self,
+        log_callback,
+        state_callback=None,
+        max_queue_packets=None,
+        max_queue_bytes=None,
+    ):
         self.log_callback = log_callback
         self.state_callback = state_callback
         self.running = threading.Event()
@@ -301,18 +336,62 @@ class NetworkWorker:
         self.dispatch_thread = None
         self.handle = None
 
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.cond = threading.Condition(self.lock)
-        self.heap = []
+        self.waiting_heap = []
+        self.ready_heaps = {"outbound": [], "inbound": [], "unknown": []}
+        # Compatibility alias for older diagnostics that inspected the delay heap.
+        self.heap = self.waiting_heap
         self.packet_seq = itertools.count()
+        self.queue_bytes = 0
+        self.max_queue_packets = max(1, int(max_queue_packets or self.DEFAULT_MAX_QUEUE_PACKETS))
+        self.max_queue_bytes = max(1024, int(max_queue_bytes or self.DEFAULT_MAX_QUEUE_BYTES))
 
         self.delay_ms = 100
+        self.jitter_ms = 0
         self.loss_percent = 0
-        self.filter_text = "true"
+        self.reorder_percent = 0
+        self.burst_trigger_percent = 0
+        self.burst_length = 0
+        self.burst_remaining = 0
+        self.upload_bps = 0.0
+        self.download_bps = 0.0
+        self.auto_stop_seconds = 0.0
+        self.auto_stop_deadline = 0.0
+        self.filter_text = "!impostor"
+
+        self._flow_last_send = {}
+        self._flow_fair_finish = {}
+        self._direction_virtual_finish = {"outbound": 0.0, "inbound": 0.0, "unknown": 0.0}
+        self._last_flow_cleanup_at = 0.0
+        self._direction_cursor = 0
+        self._tokens = {"outbound": 0.0, "inbound": 0.0, "unknown": 0.0}
+        self._token_updated_at = {"outbound": 0.0, "inbound": 0.0, "unknown": 0.0}
+        self._bandwidth_waiting_sequences = set()
+        self._rate_events = {
+            "outbound": deque(maxlen=20),
+            "inbound": deque(maxlen=20),
+            "unknown": deque(maxlen=20),
+        }
 
         self.captured_count = 0
         self.dropped_count = 0
+        self.simulated_drop_count = 0
+        self.random_drop_count = 0
+        self.burst_drop_count = 0
+        self.reordered_count = 0
+        self.bandwidth_wait_count = 0
+        self.queue_overflow_count = 0
+        self.send_failure_count = 0
+        self.cancelled_count = 0
         self.sent_count = 0
+        self.sent_bytes = {"outbound": 0, "inbound": 0, "unknown": 0}
+        self.peak_queue_count = 0
+        self.peak_queue_bytes = 0
+        self.started_at = 0.0
+        self.elapsed_at_stop = 0.0
+        self._last_overflow_log_at = 0.0
+        self.auto_stop_thread = None
 
     def _emit_state(self, phase, message=""):
         callback = self.state_callback
@@ -323,7 +402,232 @@ class NetworkWorker:
         except Exception:
             pass
 
-    def start(self, delay_ms: int, loss_percent: int, filter_text: str):
+    @staticmethod
+    def validate_filter(filter_text: str):
+        try:
+            import pydivert
+        except Exception as exc:
+            raise RuntimeError("未安装 pydivert / WinDivert，请先运行 run.bat 或 build_exe.bat 安装依赖") from exc
+        try:
+            valid, position, error = pydivert.WinDivert.check_filter(str(filter_text or "true"))
+        except Exception as exc:
+            raise ValueError(f"WinDivert 规则校验失败：{exc}") from exc
+        if not valid:
+            position_text = f"，位置 {position}" if position is not None else ""
+            raise ValueError(f"高级规则语法无效{position_text}：{error or '无法解析过滤表达式'}")
+        return True
+
+    @staticmethod
+    def _packet_size(packet) -> int:
+        raw = getattr(packet, "raw", None)
+        if raw is not None:
+            try:
+                return max(0, len(raw))
+            except Exception:
+                pass
+        try:
+            return max(0, len(packet))
+        except Exception:
+            return 0
+
+    def _is_active(self, generation) -> bool:
+        return generation == self._start_generation and self.running.is_set()
+
+    def _queue_count_locked(self) -> int:
+        return len(self.waiting_heap) + sum(len(heap) for heap in self.ready_heaps.values())
+
+    def _clear_flow_state_locked(self):
+        self._flow_last_send.clear()
+        self._flow_fair_finish.clear()
+        for direction in self._direction_virtual_finish:
+            self._direction_virtual_finish[direction] = 0.0
+        self._last_flow_cleanup_at = 0.0
+
+    def _bandwidth_rate(self, direction: str) -> float:
+        if direction == "outbound":
+            return self.upload_bps
+        if direction == "inbound":
+            return self.download_bps
+        configured = [rate for rate in (self.upload_bps, self.download_bps) if rate > 0]
+        return min(configured) if configured else 0.0
+
+    def _token_capacity(self, direction: str) -> float:
+        rate_bytes = self._bandwidth_rate(direction) / 8.0
+        if rate_bytes <= 0:
+            return float("inf")
+        return max(65535.0, rate_bytes * 0.25)
+
+    def _reset_bandwidth_state_locked(self, now=None):
+        now = time.monotonic() if now is None else now
+        self._direction_cursor = 0
+        self._bandwidth_waiting_sequences.clear()
+        for direction in self._tokens:
+            self._tokens[direction] = 0.0
+            self._token_updated_at[direction] = now
+            self._rate_events[direction].clear()
+
+    def _refresh_tokens_locked(self, direction: str, now: float):
+        rate_bytes = self._bandwidth_rate(direction) / 8.0
+        if rate_bytes <= 0:
+            self._tokens[direction] = float("inf")
+            self._token_updated_at[direction] = now
+            return
+        previous = self._token_updated_at.get(direction, now) or now
+        elapsed = max(0.0, now - previous)
+        self._tokens[direction] = min(
+            self._token_capacity(direction),
+            self._tokens.get(direction, 0.0) + elapsed * rate_bytes,
+        )
+        self._token_updated_at[direction] = now
+
+    def _bandwidth_wait_seconds_locked(self, direction: str, packet_size: int, now: float) -> float:
+        rate_bytes = self._bandwidth_rate(direction) / 8.0
+        if rate_bytes <= 0:
+            return 0.0
+        self._refresh_tokens_locked(direction, now)
+        deficit = max(0.0, max(1, packet_size) - self._tokens[direction])
+        return deficit / rate_bytes
+
+    def _reset_stats_locked(self):
+        self.waiting_heap.clear()
+        for heap in self.ready_heaps.values():
+            heap.clear()
+        self.queue_bytes = 0
+        self.captured_count = 0
+        self.dropped_count = 0
+        self.simulated_drop_count = 0
+        self.random_drop_count = 0
+        self.burst_drop_count = 0
+        self.reordered_count = 0
+        self.bandwidth_wait_count = 0
+        self.queue_overflow_count = 0
+        self.send_failure_count = 0
+        self.cancelled_count = 0
+        self.sent_count = 0
+        for direction in self.sent_bytes:
+            self.sent_bytes[direction] = 0
+        self.peak_queue_count = 0
+        self.peak_queue_bytes = 0
+        self.started_at = 0.0
+        self.elapsed_at_stop = 0.0
+        self._last_overflow_log_at = 0.0
+        self.packet_seq = itertools.count()
+        self.burst_remaining = 0
+        self.auto_stop_deadline = 0.0
+        self._clear_flow_state_locked()
+        self._reset_bandwidth_state_locked()
+
+    def _prune_rate_events_locked(self, now: float):
+        cutoff = now - self.RATE_WINDOW_SECONDS
+        for events in self._rate_events.values():
+            while events and events[0][0] < cutoff:
+                events.popleft()
+
+    def _current_rate_bps_locked(self, direction: str, now: float) -> float:
+        self._prune_rate_events_locked(now)
+        return sum(size for _, size in self._rate_events[direction]) * 8.0 / self.RATE_WINDOW_SECONDS
+
+    def _record_rate_event_locked(self, direction: str, now: float, packet_size: int):
+        bucket = int(now * 10) / 10.0
+        events = self._rate_events[direction]
+        if events and events[-1][0] == bucket:
+            _, current_size = events.pop()
+            events.append((bucket, current_size + packet_size))
+        else:
+            events.append((bucket, packet_size))
+
+    def stats_snapshot(self):
+        with self.lock:
+            now = time.monotonic()
+            elapsed = self.elapsed_at_stop
+            if self.started_at:
+                elapsed = max(0.0, now - self.started_at) if self.running.is_set() else self.elapsed_at_stop
+            lost = self.random_drop_count + self.burst_drop_count + self.queue_overflow_count + self.send_failure_count
+            loss_rate = (lost / self.captured_count * 100.0) if self.captured_count else 0.0
+            remaining = 0.0
+            if self.running.is_set() and self.auto_stop_deadline:
+                remaining = max(0.0, self.auto_stop_deadline - now)
+            return {
+                "captured": self.captured_count,
+                "sent": self.sent_count,
+                "dropped": self.dropped_count,
+                "simulated_drop": self.simulated_drop_count,
+                "random_drop": self.random_drop_count,
+                "burst_drop": self.burst_drop_count,
+                "reordered": self.reordered_count,
+                "bandwidth_wait": self.bandwidth_wait_count,
+                "queue_overflow": self.queue_overflow_count,
+                "send_failure": self.send_failure_count,
+                "cancelled": self.cancelled_count,
+                "queue_count": self._queue_count_locked(),
+                "queue_bytes": self.queue_bytes,
+                "peak_queue_count": self.peak_queue_count,
+                "peak_queue_bytes": self.peak_queue_bytes,
+                "loss_rate": loss_rate,
+                "elapsed_seconds": elapsed,
+                "remaining_seconds": remaining,
+                "auto_stop_enabled": self.auto_stop_seconds > 0,
+                "upload_bps": self._current_rate_bps_locked("outbound", now),
+                "download_bps": self._current_rate_bps_locked("inbound", now),
+            }
+
+    def _effective_delay_ms(self) -> float:
+        if self.jitter_ms <= 0:
+            return float(self.delay_ms)
+        return max(0.0, float(self.delay_ms) + random.uniform(-self.jitter_ms, self.jitter_ms))
+
+    def _cancel_queued_locked(self):
+        cancelled = self._queue_count_locked()
+        if cancelled:
+            self.cancelled_count += cancelled
+            self.waiting_heap.clear()
+            for heap in self.ready_heaps.values():
+                heap.clear()
+            self.queue_bytes = 0
+        self._bandwidth_waiting_sequences.clear()
+        return cancelled
+
+    def _close_handle(self):
+        handle = self.handle
+        self.handle = None
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+
+    def _fail_runtime(self, message: str, generation):
+        with self.cond:
+            if generation != self._start_generation:
+                return
+            if not self.running.is_set() and self.startup_error:
+                return
+            if self.started_at:
+                self.elapsed_at_stop = max(0.0, time.monotonic() - self.started_at)
+            self.startup_error = str(message or "弱网模拟运行异常")
+            self.running.clear()
+            self._cancel_queued_locked()
+            self._clear_flow_state_locked()
+            self.cond.notify_all()
+        self.startup_event.set()
+        self._close_handle()
+        self._emit_state(TaskPhase.FAILED, self.startup_error)
+        self.log_callback(self.startup_error)
+
+    def start(
+        self,
+        delay_ms: int,
+        loss_percent: int,
+        filter_text: str,
+        jitter_ms: int = 0,
+        *,
+        reorder_percent: int = 0,
+        upload_bps: float = 0,
+        download_bps: float = 0,
+        burst_trigger_percent: int = 0,
+        burst_length: int = 0,
+        auto_stop_seconds: float = 0,
+    ):
         if self.running.is_set():
             return
 
@@ -331,147 +635,378 @@ class NetworkWorker:
             raise PermissionError("弱网功能需要管理员权限，请点击“管理员重启”后再使用")
 
         try:
-            import pydivert
+            import pydivert  # noqa: F401
         except Exception as exc:
             raise RuntimeError("未安装 pydivert / WinDivert，请先运行 run.bat 或 build_exe.bat 安装依赖") from exc
 
-        self.delay_ms = max(0, int(delay_ms))
-        self.loss_percent = min(100, max(0, int(loss_percent)))
-        self.filter_text = filter_text.strip() or "true"
-
-        self.captured_count = 0
-        self.dropped_count = 0
-        self.sent_count = 0
-        self.packet_seq = itertools.count()
-        self.startup_error = ""
-        self.startup_event.clear()
-        self._start_generation += 1
-        generation = self._start_generation
+        protected_filter = ensure_windivert_impostor_guard(filter_text)
+        self.validate_filter(protected_filter)
+        with self.cond:
+            self.delay_ms = max(0, int(delay_ms))
+            self.jitter_ms = max(0, int(jitter_ms))
+            self.loss_percent = min(100, max(0, int(loss_percent)))
+            self.reorder_percent = min(100, max(0, int(reorder_percent)))
+            self.upload_bps = max(0.0, float(upload_bps))
+            self.download_bps = max(0.0, float(download_bps))
+            self.burst_trigger_percent = min(100, max(0, int(burst_trigger_percent)))
+            self.burst_length = max(0, int(burst_length))
+            self.auto_stop_seconds = max(0.0, float(auto_stop_seconds))
+            self.filter_text = protected_filter
+            self._reset_stats_locked()
+            self.startup_error = ""
+            self.startup_event.clear()
+            self._start_generation += 1
+            generation = self._start_generation
+            self.running.set()
 
         self._emit_state(TaskPhase.STARTING, "正在初始化 WinDivert")
-        self.running.set()
-        self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
-        self.dispatch_thread = threading.Thread(target=self._dispatch_loop, daemon=True)
+        self.capture_thread = threading.Thread(target=self._capture_loop, args=(generation,), daemon=True)
+        self.dispatch_thread = threading.Thread(target=self._dispatch_loop, args=(generation,), daemon=True)
         self.capture_thread.start()
         self.dispatch_thread.start()
+        if self.auto_stop_seconds > 0:
+            self.auto_stop_thread = threading.Thread(target=self._auto_stop_loop, args=(generation,), daemon=True)
+            self.auto_stop_thread.start()
+        else:
+            self.auto_stop_thread = None
         threading.Thread(target=self._watch_startup, args=(generation,), daemon=True).start()
 
     def _watch_startup(self, generation):
         if self.startup_event.wait(timeout=self.startup_timeout_seconds):
             return
-        if generation != self._start_generation or not self.running.is_set():
+        if not self._is_active(generation):
             return
-        self.startup_error = f"WinDivert 启动确认超时（{self.startup_timeout_seconds} 秒）"
-        self.running.clear()
-        try:
-            if self.handle:
-                self.handle.close()
-        except Exception:
-            pass
-        with self.cond:
-            self.cond.notify_all()
-        self._emit_state(TaskPhase.FAILED, self.startup_error)
-        self.log_callback(self.startup_error)
+        self._fail_runtime(f"WinDivert 启动确认超时（{self.startup_timeout_seconds} 秒）", generation)
 
-    def stop(self):
-        was_running = self.running.is_set()
-        if was_running:
-            self._emit_state(TaskPhase.STOPPING, "正在停止弱网模拟")
-        self.running.clear()
-        with self.cond:
-            self.heap.clear()
-            self.cond.notify_all()
+    def _auto_stop_loop(self, generation):
+        while self._is_active(generation):
+            with self.cond:
+                deadline = self.auto_stop_deadline
+                if not deadline:
+                    self.cond.wait(timeout=0.1)
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    self.cond.wait(timeout=min(remaining, 0.2))
+                    continue
+            if self._is_active(generation):
+                self.log_callback("已达到设定的模拟时长，正在自动恢复正常网络")
+                self.stop("已按计划自动停止并恢复正常网络")
+            return
 
-        try:
-            if self.handle:
-                self.handle.close()
-        except Exception:
-            pass
-        self.handle = None
+    def stop(self, status_message="弱网模拟已停止"):
+        with self.cond:
+            was_running = self.running.is_set()
+            if was_running:
+                self._emit_state(TaskPhase.STOPPING, "正在停止弱网模拟")
+            if self.started_at:
+                self.elapsed_at_stop = max(0.0, time.monotonic() - self.started_at)
+            self.running.clear()
+            self._start_generation += 1
+            self._cancel_queued_locked()
+            self._clear_flow_state_locked()
+            self.cond.notify_all()
         self.startup_event.set()
-        if was_running:
-            self._emit_state(TaskPhase.IDLE, "弱网模拟已停止")
+        self._close_handle()
 
-    def _capture_loop(self):
-        failed = False
+        deadline = time.monotonic() + 1.0
+        current = threading.current_thread()
+        for thread in (self.capture_thread, self.dispatch_thread, self.auto_stop_thread):
+            if thread is not None and thread is not current and thread.is_alive():
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if was_running:
+            self.log_callback(status_message)
+            self._emit_state(TaskPhase.IDLE, status_message)
+
+    @staticmethod
+    def _safe_packet_attr(packet, name, default=None):
+        try:
+            value = getattr(packet, name, default)
+            return default if value is None else value
+        except Exception:
+            return default
+
+    @classmethod
+    def _packet_direction(cls, packet) -> str:
+        if bool(cls._safe_packet_attr(packet, "is_outbound", False)):
+            return "outbound"
+        if bool(cls._safe_packet_attr(packet, "is_inbound", False)):
+            return "inbound"
+        direction = str(cls._safe_packet_attr(packet, "direction", "")).lower()
+        if "out" in direction:
+            return "outbound"
+        if "in" in direction:
+            return "inbound"
+        return "unknown"
+
+    @classmethod
+    def _packet_flow_key(cls, packet, direction=None):
+        direction = direction or cls._packet_direction(packet)
+        protocol = cls._safe_packet_attr(packet, "protocol", "unknown")
+        if isinstance(protocol, tuple):
+            protocol = protocol[0]
+        return (
+            direction,
+            str(protocol),
+            str(cls._safe_packet_attr(packet, "src_addr", "")),
+            str(cls._safe_packet_attr(packet, "dst_addr", "")),
+            int(cls._safe_packet_attr(packet, "src_port", 0) or 0),
+            int(cls._safe_packet_attr(packet, "dst_port", 0) or 0),
+        )
+
+    def _cleanup_flow_state_locked(self, now: float, force=False):
+        if not force and now - self._last_flow_cleanup_at < self.FLOW_CLEANUP_INTERVAL_SECONDS:
+            return
+        cutoff = now - self.FLOW_STATE_TTL_SECONDS
+        queued_flows = {item[5] for item in self.waiting_heap}
+        for heap in self.ready_heaps.values():
+            queued_flows.update(item[4] for item in heap)
+        for state in (self._flow_last_send, self._flow_fair_finish):
+            stale = [
+                key
+                for key, (_, last_seen) in state.items()
+                if last_seen < cutoff and key not in queued_flows
+            ]
+            for key in stale:
+                state.pop(key, None)
+        self._last_flow_cleanup_at = now
+
+    def _schedule_packet(self, packet, generation, now=None) -> bool:
+        now = time.monotonic() if now is None else now
+        direction = self._packet_direction(packet)
+        flow_key = self._packet_flow_key(packet, direction)
+        natural_send_at = now + self._effective_delay_ms() / 1000.0
+        reordered = False
+        with self.cond:
+            if not self._is_active(generation):
+                return False
+            self._cleanup_flow_state_locked(now)
+            previous_send_at, _ = self._flow_last_send.get(flow_key, (None, now))
+            if (
+                self.reorder_percent > 0
+                and previous_send_at is not None
+                and previous_send_at > now + 0.0001
+                and random.random() < self.reorder_percent / 100.0
+            ):
+                lead = min(0.05, max(0.001, (previous_send_at - now) / 2.0))
+                send_at = max(now, previous_send_at - lead)
+                reordered = send_at < previous_send_at
+            else:
+                send_at = natural_send_at
+                if previous_send_at is not None:
+                    send_at = max(send_at, previous_send_at)
+            self._flow_last_send[flow_key] = (send_at, now)
+            return self._enqueue_packet(
+                packet,
+                send_at,
+                generation,
+                flow_key=flow_key,
+                direction=direction,
+                reordered=reordered,
+                now=now,
+            )
+
+    def _enqueue_packet(
+        self,
+        packet,
+        send_at: float,
+        generation,
+        *,
+        flow_key=None,
+        direction=None,
+        reordered=False,
+        now=None,
+    ) -> bool:
+        packet_size = self._packet_size(packet)
+        should_log = False
+        now = time.monotonic() if now is None else now
+        direction = direction or self._packet_direction(packet)
+        flow_key = flow_key or self._packet_flow_key(packet, direction)
+        with self.cond:
+            if not self._is_active(generation):
+                return False
+            if self._queue_count_locked() >= self.max_queue_packets or self.queue_bytes + packet_size > self.max_queue_bytes:
+                self.queue_overflow_count += 1
+                self.dropped_count += 1
+                if now - self._last_overflow_log_at >= 1.0:
+                    self._last_overflow_log_at = now
+                    should_log = True
+            else:
+                previous_finish, _ = self._flow_fair_finish.get(flow_key, (0.0, now))
+                baseline_finish = max(previous_finish, self._direction_virtual_finish[direction]) + max(1, packet_size)
+                fair_rank = max(0.0, previous_finish - 0.5) if reordered else baseline_finish
+                self._flow_fair_finish[flow_key] = (baseline_finish, now)
+                sequence = next(self.packet_seq)
+                heapq.heappush(
+                    self.waiting_heap,
+                    (send_at, sequence, fair_rank, packet_size, packet, flow_key, direction),
+                )
+                self.queue_bytes += packet_size
+                if reordered:
+                    self.reordered_count += 1
+                self.peak_queue_count = max(self.peak_queue_count, self._queue_count_locked())
+                self.peak_queue_bytes = max(self.peak_queue_bytes, self.queue_bytes)
+                self.cond.notify()
+                return True
+        if should_log:
+            self.log_callback(
+                f"延迟队列已满，数据包被丢弃；上限 {self.max_queue_packets} 包 / {self.max_queue_bytes // (1024 * 1024)} MB"
+            )
+        return False
+
+    def _move_due_packets_locked(self, now: float):
+        while self.waiting_heap and self.waiting_heap[0][0] <= now:
+            _, sequence, fair_rank, packet_size, packet, flow_key, direction = heapq.heappop(self.waiting_heap)
+            heapq.heappush(
+                self.ready_heaps[direction],
+                (fair_rank, sequence, packet_size, packet, flow_key),
+            )
+
+    def _select_ready_packet_locked(self, now: float):
+        directions = ("outbound", "inbound", "unknown")
+        ordered = directions[self._direction_cursor :] + directions[: self._direction_cursor]
+        candidates = []
+        for order_index, direction in enumerate(ordered):
+            heap = self.ready_heaps[direction]
+            if not heap:
+                continue
+            _, sequence, packet_size, _, _ = heap[0]
+            wait_seconds = self._bandwidth_wait_seconds_locked(direction, packet_size, now)
+            candidates.append((wait_seconds, order_index, direction, sequence))
+        if not candidates:
+            return None, None
+        wait_seconds, _, direction, sequence = min(candidates)
+        if wait_seconds > 0:
+            if sequence not in self._bandwidth_waiting_sequences:
+                self._bandwidth_waiting_sequences.add(sequence)
+                self.bandwidth_wait_count += 1
+            return None, wait_seconds
+
+        fair_rank, sequence, packet_size, packet, flow_key = heapq.heappop(self.ready_heaps[direction])
+        rate = self._bandwidth_rate(direction)
+        if rate > 0:
+            self._tokens[direction] = max(0.0, self._tokens[direction] - max(1, packet_size))
+        self._bandwidth_waiting_sequences.discard(sequence)
+        self.queue_bytes = max(0, self.queue_bytes - packet_size)
+        self._direction_virtual_finish[direction] = max(
+            self._direction_virtual_finish[direction], fair_rank
+        )
+        self._direction_cursor = (directions.index(direction) + 1) % len(directions)
+        return (packet, packet_size, direction, flow_key), 0.0
+
+    def _should_drop_packet(self) -> bool:
+        with self.lock:
+            if self.burst_remaining > 0:
+                self.burst_remaining -= 1
+                self.burst_drop_count += 1
+                self.dropped_count += 1
+                return True
+            if (
+                self.burst_trigger_percent > 0
+                and self.burst_length > 0
+                and random.random() < self.burst_trigger_percent / 100.0
+            ):
+                self.burst_remaining = max(0, self.burst_length - 1)
+                self.burst_drop_count += 1
+                self.dropped_count += 1
+                return True
+            if self.loss_percent > 0 and random.random() < self.loss_percent / 100.0:
+                self.random_drop_count += 1
+                self.simulated_drop_count += 1
+                self.dropped_count += 1
+                return True
+        return False
+
+    def _capture_loop(self, generation):
         try:
             import pydivert
 
             self.log_callback(f"WinDivert 过滤规则：{self.filter_text}")
-            self.handle = pydivert.WinDivert(self.filter_text)
-            self.handle.open()
-            if not self.running.is_set():
+            handle = pydivert.WinDivert(self.filter_text)
+            with self.lock:
+                if not self._is_active(generation):
+                    return
+                self.handle = handle
+            handle.open()
+            if not self._is_active(generation):
+                self._close_handle()
                 return
+            with self.cond:
+                self.started_at = time.monotonic()
+                if self.auto_stop_seconds > 0:
+                    self.auto_stop_deadline = self.started_at + self.auto_stop_seconds
+                self.cond.notify_all()
             self.startup_event.set()
             self._emit_state(TaskPhase.RUNNING, "弱网模拟运行中")
             self.log_callback("已开始拦截本机网络包")
 
-            while self.running.is_set():
+            while self._is_active(generation):
                 try:
-                    packet = self.handle.recv()
-                except Exception:
-                    if self.running.is_set():
-                        self.log_callback("接收数据包失败，已停止")
-                    break
+                    packet = handle.recv()
+                except Exception as exc:
+                    if self._is_active(generation):
+                        self._fail_runtime(f"运行中接收数据包失败：{exc}", generation)
+                    return
 
-                self.captured_count += 1
+                with self.lock:
+                    self.captured_count += 1
 
-                if self.loss_percent > 0 and random.random() < (self.loss_percent / 100):
-                    self.dropped_count += 1
+                if self._should_drop_packet():
                     continue
 
-                send_at = time.monotonic() + (self.delay_ms / 1000)
-
-                with self.cond:
-                    heapq.heappush(self.heap, (send_at, next(self.packet_seq), packet))
-                    self.cond.notify()
+                self._schedule_packet(packet, generation)
 
         except Exception as exc:
-            failed = True
-            self.startup_error = str(exc)
-            self.running.clear()
-            self.startup_event.set()
-            self._emit_state(TaskPhase.FAILED, self.startup_error)
-            self.log_callback(f"启动失败：{exc}")
+            if self._is_active(generation):
+                self._fail_runtime(f"WinDivert 启动失败：{exc}", generation)
         finally:
-            self.running.clear()
             self.startup_event.set()
+
+    def _dispatch_loop(self, generation):
+        while self._is_active(generation):
+            selected = None
             with self.cond:
-                self.cond.notify_all()
-            if not failed and not self.startup_error:
-                self._emit_state(TaskPhase.IDLE, "弱网模拟已停止")
-
-    def _dispatch_loop(self):
-        while self.running.is_set():
-            packet = None
-
-            with self.cond:
-                while self.running.is_set() and not self.heap:
-                    self.cond.wait(timeout=0.2)
-
-                if not self.running.is_set():
-                    break
-
-                while self.heap and self.running.is_set():
-                    send_at, _, candidate = self.heap[0]
+                while self._is_active(generation) and selected is None:
                     now = time.monotonic()
+                    self._move_due_packets_locked(now)
+                    selected, bandwidth_wait = self._select_ready_packet_locked(now)
+                    if selected is not None:
+                        break
+                    waits = [0.2]
+                    if self.waiting_heap:
+                        waits.append(max(0.0, self.waiting_heap[0][0] - now))
+                    if bandwidth_wait is not None:
+                        waits.append(max(0.0, bandwidth_wait))
+                    positive_waits = [value for value in waits if value > 0]
+                    self.cond.wait(timeout=min(positive_waits) if positive_waits else 0.01)
 
-                    if send_at > now:
-                        self.cond.wait(timeout=min(send_at - now, 0.2))
-                        continue
-
-                    heapq.heappop(self.heap)
-                    packet = candidate
-                    break
-
-            if packet is not None and self.running.is_set():
-                try:
-                    handle = self.handle
-                    if handle is not None:
-                        handle.send(packet)
-                        self.sent_count += 1
-                except Exception:
-                    pass
+            if selected is None:
+                continue
+            packet, packet_size, direction, _ = selected
+            if not self._is_active(generation):
+                with self.lock:
+                    self.cancelled_count += 1
+                continue
+            try:
+                handle = self.handle
+                if handle is None:
+                    raise RuntimeError("WinDivert 句柄已不可用")
+                handle.send(packet)
+                with self.lock:
+                    self.sent_count += 1
+                    self.sent_bytes[direction] += packet_size
+                    self._record_rate_event_locked(direction, time.monotonic(), packet_size)
+            except Exception as exc:
+                active = self._is_active(generation)
+                with self.lock:
+                    if active:
+                        self.send_failure_count += 1
+                        self.dropped_count += 1
+                    else:
+                        self.cancelled_count += 1
+                if active:
+                    self._fail_runtime(f"运行中发送数据包失败：{exc}", generation)
+                break
 
 
 # ---------------- ADB Log Capture ----------------
@@ -894,10 +1429,26 @@ class XiaoXinAssistant(ctk.CTk):
         self.protocol_var = tk.StringVar(value="全部")
         self.direction_var = tk.StringVar(value="全部")
         self.delay_var = tk.StringVar(value="100")
+        self.jitter_var = tk.StringVar(value="0")
         self.loss_var = tk.StringVar(value="0")
+        self.reorder_var = tk.StringVar(value="0")
+        self.upload_bandwidth_var = tk.StringVar(value="0")
+        self.download_bandwidth_var = tk.StringVar(value="0")
+        self.bandwidth_unit_var = tk.StringVar(value="Mbps")
+        self.burst_trigger_var = tk.StringVar(value="0")
+        self.burst_length_var = tk.StringVar(value="0")
+        self.network_duration_var = tk.StringVar(value="0")
         self.advanced_filter_var = tk.StringVar(value="")
+        self.network_guide_visible = True
         self.network_status_var = tk.StringVar(value="运行状态：待命")
-        self.network_stats_var = tk.StringVar(value="捕获 0 ｜ 丢弃 0 ｜ 放行 0")
+        self.network_delay_hint_var = tk.StringVar(value="单向延迟 100ms；全部方向预计额外 RTT 约 200ms")
+        self.network_stats_var = tk.StringVar(
+            value="捕获 0 ｜ 放行 0 ｜ 随机丢包 0 ｜ 突发丢包 0 ｜ 乱序 0\n"
+            "限速等待 0 ｜ 队列 0/峰值 0（0 B）｜ 溢出 0 ｜ 发送失败 0\n"
+            "上行 0 bps ｜ 下行 0 bps ｜ 丢包率 0.00% ｜ 剩余 -- ｜ 运行 00:00"
+        )
+        for variable in (self.delay_var, self.jitter_var, self.direction_var):
+            variable.trace_add("write", lambda *_args: self._update_network_delay_hint())
 
         # ADB log vars
         self.log_pkg_var = tk.StringVar(value=DEFAULT_PKG_NAME)
@@ -1942,7 +2493,7 @@ class XiaoXinAssistant(ctk.CTk):
                 self._build_clicker_page()
         elif key == "network":
             self.page_title.configure(text="网络弱网")
-            self.page_subtitle.configure(text="对指定 IP 模拟延迟与丢包，仅用于本机测试")
+            self.page_subtitle.configure(text="为本机及模拟器流量模拟延迟、抖动和丢包")
             self._set_badge(self.network.running.is_set(), admin_required=True)
             if needs_build:
                 self._build_network_page()
@@ -2045,6 +2596,25 @@ class XiaoXinAssistant(ctk.CTk):
 
     def _on_network_state(self, phase, message=""):
         self._set_task_phase("network", phase, message)
+        labels = {
+            TaskPhase.IDLE: "已停止",
+            TaskPhase.STARTING: "正在启动…",
+            TaskPhase.RUNNING: "运行中",
+            TaskPhase.STOPPING: "正在停止…",
+            TaskPhase.FAILED: f"运行异常：{message}" if message else "运行异常",
+        }
+
+        def update_status():
+            try:
+                self.network_status_var.set(labels.get(phase, message or str(phase)))
+                self._refresh_network_button()
+            except Exception:
+                pass
+
+        try:
+            self.after(0, update_status)
+        except Exception:
+            pass
 
     def _sync_legacy_task_states(self):
         """Mirror legacy flags into one UI-facing task-state registry."""
@@ -2761,21 +3331,44 @@ class XiaoXinAssistant(ctk.CTk):
         wrap.grid_columnconfigure(0, weight=1)
         wrap.grid_rowconfigure(2, weight=1)
 
-        card = self._card(wrap)
-        card.grid_columnconfigure((0, 1), weight=1, uniform="network_settings")
+        tabs = ctk.CTkTabview(
+            wrap,
+            height=280,
+            corner_radius=14,
+            border_width=1,
+            border_color=COLOR_BORDER,
+            fg_color=COLOR_SURFACE,
+            segmented_button_fg_color=COLOR_SURFACE_2,
+            segmented_button_selected_color=COLOR_ACCENT,
+            segmented_button_selected_hover_color=COLOR_ACCENT_HOVER,
+        )
+        tabs.pack(fill="x", pady=(0, 10))
+        basic_tab = tabs.add("基础设置")
+        advanced_tab = tabs.add("进阶模拟")
+        for tab in (basic_tab, advanced_tab):
+            tab.grid_columnconfigure((0, 1), weight=1, uniform="network_settings")
+
+        def inline_entry(parent, row, col, label, variable, placeholder=""):
+            box = ctk.CTkFrame(parent, fg_color="transparent")
+            box.grid(row=row, column=col, sticky="ew", padx=(0, 12), pady=4)
+            box.grid_columnconfigure(1, weight=1)
+            ctk.CTkLabel(box, text=label, width=150, text_color=COLOR_MUTED, font=self._font(12), anchor="w").grid(row=0, column=0, sticky="w", padx=(0, 8))
+            entry = ctk.CTkEntry(box, textvariable=variable, placeholder_text=placeholder, height=34, corner_radius=9, fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(12))
+            entry.grid(row=0, column=1, sticky="ew")
+            return entry
 
         self.network_parameter_widgets.append(
-            self._small_entry(card, 0, 0, "目标 IP", self.target_ip_var, "留空 = 全部，例如 8.8.8.8")
+            inline_entry(basic_tab, 0, 0, "目标 IP", self.target_ip_var, "留空 = 全部流量")
         )
         self.network_parameter_widgets.append(
-            self._small_entry(card, 0, 1, "高级规则", self.advanced_filter_var, "可选；填写后覆盖其他规则")
+            inline_entry(basic_tab, 0, 1, "高级规则", self.advanced_filter_var, "可选，自动加安全保护")
         )
 
-        def compact_option(row, col, label, variable, values):
-            box = ctk.CTkFrame(card, fg_color="transparent")
-            box.grid(row=row, column=col, sticky="ew", padx=(0, 12), pady=5)
-            box.grid_columnconfigure(0, weight=1)
-            ctk.CTkLabel(box, text=label, text_color=COLOR_MUTED, font=self._font(12), anchor="w").grid(row=0, column=0, sticky="ew")
+        def compact_option(parent, row, col, label, variable, values):
+            box = ctk.CTkFrame(parent, fg_color="transparent")
+            box.grid(row=row, column=col, sticky="ew", padx=(0, 12), pady=4)
+            box.grid_columnconfigure(1, weight=1)
+            ctk.CTkLabel(box, text=label, width=150, text_color=COLOR_MUTED, font=self._font(12), anchor="w").grid(row=0, column=0, sticky="w", padx=(0, 8))
             menu = ctk.CTkOptionMenu(
                 box,
                 variable=variable,
@@ -2788,43 +3381,190 @@ class XiaoXinAssistant(ctk.CTk):
                 text_color=COLOR_TEXT,
                 font=self._font(12),
             )
-            menu.grid(row=1, column=0, sticky="ew", pady=(3, 0))
+            menu.grid(row=0, column=1, sticky="ew")
             return menu
 
-        self.network_parameter_widgets.append(compact_option(1, 0, "协议类型", self.protocol_var, ["全部", "TCP", "UDP", "ICMP"]))
-        self.network_parameter_widgets.append(compact_option(1, 1, "方向", self.direction_var, ["全部", "出站", "入站"]))
-        self.network_parameter_widgets.append(self._small_entry(card, 2, 0, "延迟时间（毫秒）", self.delay_var, "例如 300"))
-        self.network_parameter_widgets.append(self._small_entry(card, 2, 1, "丢包概率（0-100）", self.loss_var, "例如 5"))
+        self.network_parameter_widgets.append(compact_option(basic_tab, 1, 0, "协议类型", self.protocol_var, ["全部", "TCP", "UDP", "ICMP"]))
+        self.network_parameter_widgets.append(compact_option(basic_tab, 1, 1, "方向", self.direction_var, ["全部", "出站", "入站"]))
+        self.network_parameter_widgets.append(inline_entry(basic_tab, 2, 0, "基础单向延迟（ms）", self.delay_var, "例如 300"))
+        self.network_parameter_widgets.append(inline_entry(basic_tab, 2, 1, "延迟抖动（±ms）", self.jitter_var, "0 = 固定延迟"))
+        self.network_parameter_widgets.append(inline_entry(basic_tab, 3, 0, "随机丢包概率", self.loss_var, "0～100"))
+        self.network_parameter_widgets.append(inline_entry(basic_tab, 3, 1, "数据包乱序概率", self.reorder_var, "0～100，默认关闭"))
+        delay_hint = ctk.CTkLabel(
+            basic_tab,
+            textvariable=self.network_delay_hint_var,
+            text_color=COLOR_MUTED,
+            font=self._font(12),
+            anchor="w",
+            justify="left",
+            wraplength=860,
+        )
+        delay_hint.grid(row=4, column=0, columnspan=2, sticky="ew", padx=(4, 12), pady=(4, 2))
+
+        self.network_parameter_widgets.append(inline_entry(advanced_tab, 0, 0, "上行带宽", self.upload_bandwidth_var, "0 = 不限速"))
+        self.network_parameter_widgets.append(inline_entry(advanced_tab, 0, 1, "下行带宽", self.download_bandwidth_var, "0 = 不限速"))
+        self.network_parameter_widgets.append(compact_option(advanced_tab, 1, 0, "带宽单位", self.bandwidth_unit_var, ["Kbps", "Mbps"]))
+        self.network_parameter_widgets.append(inline_entry(advanced_tab, 1, 1, "自动停止（分钟）", self.network_duration_var, "0 = 不自动停止"))
+        self.network_parameter_widgets.append(inline_entry(advanced_tab, 2, 0, "突发丢包触发概率", self.burst_trigger_var, "0～100"))
+        self.network_parameter_widgets.append(inline_entry(advanced_tab, 2, 1, "连续丢包数量", self.burst_length_var, "0 = 关闭"))
 
         preset = ctk.CTkFrame(wrap, fg_color=COLOR_BG)
-        preset.pack(fill="x", pady=(0, 16))
-        for text, delay, loss in [("轻微延迟", "100", "0"), ("弱网测试", "300", "2"), ("明显卡顿", "800", "5"), ("高丢包", "100", "15")]:
-            preset_button = ctk.CTkButton(preset, text=text, width=112, height=34, corner_radius=12, fg_color=COLOR_SURFACE, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13, "bold"), command=lambda d=delay, l=loss: self._apply_network_preset(d, l))
-            preset_button.pack(side="left", padx=(0, 10))
+        preset.pack(fill="x", pady=(0, 10))
+        presets = [
+            ("轻微延迟", dict(delay="100", jitter="0", loss="0")),
+            ("弱网测试", dict(delay="300", jitter="50", loss="2")),
+            ("移动网络", dict(delay="180", jitter="80", loss="3")),
+            ("海外高延迟", dict(delay="350", jitter="100", loss="1")),
+            ("低带宽", dict(delay="120", jitter="30", loss="1", upload="512", download="1024", unit="Kbps")),
+            ("突发丢包", dict(delay="120", jitter="50", loss="0", burst_trigger="5", burst_length="4")),
+            ("高丢包", dict(delay="100", jitter="30", loss="15")),
+        ]
+        preset.grid_columnconfigure(tuple(range(len(presets))), weight=1, uniform="network_presets")
+        for index, (text, config) in enumerate(presets):
+            preset_button = ctk.CTkButton(
+                preset,
+                text=text,
+                height=34,
+                corner_radius=12,
+                fg_color=COLOR_SURFACE,
+                hover_color=COLOR_HOVER,
+                border_width=1,
+                border_color=COLOR_BORDER,
+                text_color=COLOR_TEXT,
+                font=self._font(12, "bold"),
+                command=lambda values=config: self._apply_network_preset(**values),
+            )
+            preset_button.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 4))
             self.network_parameter_widgets.append(preset_button)
 
         action = ctk.CTkFrame(wrap, fg_color=COLOR_SURFACE, corner_radius=16, border_width=1, border_color=COLOR_BORDER)
         action.pack(fill="both", expand=True)
         action.grid_columnconfigure(0, weight=1)
-        action.grid_rowconfigure(2, weight=1)
+        action.grid_rowconfigure(3, weight=1)
 
-        self.network_button = ctk.CTkButton(action, text="▶  开始模拟" if not self.network.running.is_set() else "■  停止模拟", width=360, height=54, corner_radius=14, fg_color=COLOR_ACCENT if not self.network.running.is_set() else COLOR_DANGER, hover_color=COLOR_ACCENT_HOVER if not self.network.running.is_set() else COLOR_DANGER_HOVER, text_color="#FFFFFF", font=self._font(19, "bold"), command=self.toggle_network)
-        self.network_button.grid(row=0, column=0, pady=(24, 12))
+        actions = ctk.CTkFrame(action, fg_color="transparent")
+        actions.grid(row=0, column=0, pady=(18, 8))
+        self.network_button = ctk.CTkButton(actions, text="▶  开始模拟" if not self.network.running.is_set() else "■  停止模拟", width=320, height=48, corner_radius=14, fg_color=COLOR_ACCENT if not self.network.running.is_set() else COLOR_DANGER, hover_color=COLOR_ACCENT_HOVER if not self.network.running.is_set() else COLOR_DANGER_HOVER, text_color="#FFFFFF", font=self._font(18, "bold"), command=self.toggle_network)
+        self.network_button.pack(side="left", padx=(0, 10))
+        self.network_emergency_button = ctk.CTkButton(
+            actions,
+            text="立即恢复网络",
+            width=150,
+            height=48,
+            corner_radius=14,
+            fg_color="transparent",
+            hover_color=COLOR_DANGER_HOVER,
+            border_width=1,
+            border_color=COLOR_DANGER,
+            text_color=COLOR_DANGER,
+            font=self._font(14, "bold"),
+            command=self._emergency_restore_network,
+        )
+        self.network_emergency_button.pack(side="left")
 
-        ctk.CTkLabel(action, textvariable=self.network_stats_var, text_color=COLOR_MUTED, font=self._font(14)).grid(row=1, column=0, pady=(0, 10))
+        ctk.CTkLabel(action, textvariable=self.network_status_var, text_color=COLOR_TEXT, font=self._font(13, "bold")).grid(row=1, column=0, pady=(0, 6))
+        ctk.CTkLabel(action, textvariable=self.network_stats_var, text_color=COLOR_MUTED, font=self._font(12), justify="center").grid(row=2, column=0, pady=(0, 8))
 
-        self.network_log_box = ctk.CTkTextbox(action, height=130, corner_radius=14, border_width=1, border_color=COLOR_BORDER, fg_color=COLOR_SURFACE_2, text_color=COLOR_TEXT, font=self._font(13))
-        self.network_log_box.grid(row=2, column=0, sticky="nsew", padx=24, pady=(0, 24))
-        self.network_log_box.insert("end", "提示：弱网功能需要管理员权限；目标 IP 留空会影响全部匹配流量。\n")
+        self.network_bottom_frame = ctk.CTkFrame(action, fg_color="transparent")
+        self.network_bottom_frame.grid(row=3, column=0, sticky="nsew", padx=20, pady=(0, 18))
+        self.network_bottom_frame.grid_rowconfigure(0, weight=1)
+        self.network_bottom_frame.grid_columnconfigure((0, 1), weight=1, uniform="network_bottom")
+
+        guide_panel = ctk.CTkFrame(self.network_bottom_frame, fg_color=COLOR_SURFACE_2, corner_radius=12, border_width=1, border_color=COLOR_BORDER)
+        guide_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        guide_panel.grid_columnconfigure(0, weight=1)
+        guide_panel.grid_rowconfigure(1, weight=1)
+        guide_header = ctk.CTkFrame(guide_panel, fg_color="transparent")
+        guide_header.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 2))
+        ctk.CTkLabel(guide_header, text="使用说明", text_color=COLOR_TEXT, font=self._font(13, "bold")).pack(side="left")
+        self.network_guide_toggle_button = ctk.CTkButton(guide_header, text="收起", width=54, height=24, fg_color="transparent", hover_color=COLOR_HOVER, text_color=COLOR_MUTED, command=self._toggle_network_guide)
+        self.network_guide_toggle_button.pack(side="right")
+        self.network_guide_box = ctk.CTkTextbox(guide_panel, height=115, fg_color="transparent", text_color=COLOR_MUTED, font=self._font(12), wrap="word")
+        self.network_guide_box.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        self.network_guide_box.insert("end", NETWORK_USAGE_GUIDE)
+        self.network_guide_box.configure(state="disabled")
+
+        log_panel = ctk.CTkFrame(self.network_bottom_frame, fg_color=COLOR_SURFACE_2, corner_radius=12, border_width=1, border_color=COLOR_BORDER)
+        log_panel.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        log_panel.grid_columnconfigure(0, weight=1)
+        log_panel.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(log_panel, text="运行日志", text_color=COLOR_TEXT, font=self._font(13, "bold"), anchor="w").grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 2))
+        self.network_log_box = ctk.CTkTextbox(log_panel, height=115, fg_color="transparent", text_color=COLOR_TEXT, font=self._font(12), wrap="word")
+        self.network_log_box.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        self.network_log_box.insert("end", "等待启动。运行状态、生效规则和安全警告会显示在这里。\n")
         self.network_log_box.configure(state="disabled")
         self._refresh_network_button()
 
-    def _apply_network_preset(self, delay, loss):
+    def _apply_network_preset(
+        self,
+        delay="100",
+        jitter="0",
+        loss="0",
+        reorder="0",
+        upload="0",
+        download="0",
+        unit="Mbps",
+        burst_trigger="0",
+        burst_length="0",
+        duration="0",
+    ):
         if self.network.running.is_set():
             messagebox.showwarning("正在运行", "请先停止模拟，再切换预设")
             return
         self.delay_var.set(delay)
+        self.jitter_var.set(jitter)
         self.loss_var.set(loss)
+        self.reorder_var.set(reorder)
+        self.upload_bandwidth_var.set(upload)
+        self.download_bandwidth_var.set(download)
+        self.bandwidth_unit_var.set(unit)
+        self.burst_trigger_var.set(burst_trigger)
+        self.burst_length_var.set(burst_length)
+        self.network_duration_var.set(duration)
+
+    def _toggle_network_guide(self):
+        box = getattr(self, "network_guide_box", None)
+        button = getattr(self, "network_guide_toggle_button", None)
+        frame = getattr(self, "network_bottom_frame", None)
+        if box is None or button is None or frame is None:
+            return
+        self.network_guide_visible = not self.network_guide_visible
+        if self.network_guide_visible:
+            box.grid()
+            button.configure(text="收起")
+            frame.grid_columnconfigure((0, 1), weight=1, uniform="network_bottom")
+        else:
+            box.grid_remove()
+            button.configure(text="展开")
+            frame.grid_columnconfigure(0, weight=0, minsize=150, uniform="")
+            frame.grid_columnconfigure(1, weight=1, uniform="")
+
+    def _emergency_restore_network(self):
+        if not self.network.running.is_set():
+            return
+        self._network_log("用户触发立即恢复网络")
+        self._set_task_phase("network", TaskPhase.STOPPING, "正在立即恢复正常网络")
+        self.network.stop("已立即恢复正常网络")
+        self._refresh_network_button()
+
+    def _update_network_delay_hint(self):
+        try:
+            delay = max(0, int(self.delay_var.get().strip() or 0))
+        except Exception:
+            delay = 0
+        try:
+            jitter = max(0, int(self.jitter_var.get().strip() or 0))
+        except Exception:
+            jitter = 0
+        if self.direction_var.get() == "全部":
+            rtt = delay * 2
+            text = f"单向延迟 {delay}±{jitter}ms；全部方向预计额外 RTT 约 {rtt}ms"
+        else:
+            text = f"单向延迟 {delay}±{jitter}ms；当前仅作用于{self.direction_var.get()}流量"
+        try:
+            self.network_delay_hint_var.set(text)
+        except Exception:
+            pass
 
     def _refresh_network_button(self):
         button = getattr(self, "network_button", None)
@@ -2851,6 +3591,11 @@ class XiaoXinAssistant(ctk.CTk):
                 hover_color=hover,
                 state=state,
             )
+            emergency = getattr(self, "network_emergency_button", None)
+            if emergency is not None and emergency.winfo_exists():
+                emergency.configure(
+                    state="normal" if phase in (TaskPhase.STARTING, TaskPhase.RUNNING) else "disabled"
+                )
             self._set_network_controls_locked(phase in (TaskPhase.STARTING, TaskPhase.RUNNING, TaskPhase.STOPPING))
         except Exception:
             pass
@@ -2867,7 +3612,7 @@ class XiaoXinAssistant(ctk.CTk):
     def _build_filter(self):
         advanced = self.advanced_filter_var.get().strip()
         if advanced:
-            return advanced
+            return ensure_windivert_impostor_guard(advanced)
 
         parts = []
         protocol = self.protocol_var.get()
@@ -2892,20 +3637,87 @@ class XiaoXinAssistant(ctk.CTk):
             else:
                 parts.append(f"(ipv6.SrcAddr == {target_ip} or ipv6.DstAddr == {target_ip})")
 
-        return " and ".join(parts) if parts else "true"
+        return ensure_windivert_impostor_guard(" and ".join(parts) if parts else "true")
 
     def _parse_network_config(self):
         try:
             delay = int(self.delay_var.get().strip())
+            jitter = int(self.jitter_var.get().strip() or 0)
             loss = int(self.loss_var.get().strip())
+            reorder = int(self.reorder_var.get().strip() or 0)
+            upload = float(self.upload_bandwidth_var.get().strip() or 0)
+            download = float(self.download_bandwidth_var.get().strip() or 0)
+            burst_trigger = int(self.burst_trigger_var.get().strip() or 0)
+            burst_length = int(self.burst_length_var.get().strip() or 0)
+            duration_minutes = float(self.network_duration_var.get().strip() or 0)
         except ValueError as exc:
-            raise ValueError("延迟时间和丢包概率必须填写整数") from exc
+            raise ValueError("请检查弱网参数：概率和毫秒值需为整数，带宽和自动停止时间需为数字") from exc
 
         if delay < 0 or delay > 10000:
             raise ValueError("延迟时间必须在 0-10000 毫秒之间")
+        if jitter < 0 or jitter > 10000:
+            raise ValueError("延迟抖动必须在 0-10000 毫秒之间")
         if loss < 0 or loss > 100:
             raise ValueError("丢包概率必须在 0-100 之间")
-        return delay, loss, self._build_filter()
+        if reorder < 0 or reorder > 100:
+            raise ValueError("数据包乱序概率必须在 0-100 之间")
+        if upload < 0 or download < 0 or upload > 100000 or download > 100000:
+            raise ValueError("上下行带宽必须在 0-100000 之间，0 表示不限速")
+        if burst_trigger < 0 or burst_trigger > 100:
+            raise ValueError("突发丢包触发概率必须在 0-100 之间")
+        if burst_length < 0 or burst_length > 1000:
+            raise ValueError("连续丢包数量必须在 0-1000 之间")
+        if bool(burst_trigger) != bool(burst_length):
+            raise ValueError("启用突发丢包时，触发概率和连续丢包数量都必须大于 0；关闭时请都填 0")
+        if duration_minutes < 0 or duration_minutes > 1440:
+            raise ValueError("自动停止时间必须在 0-1440 分钟之间，0 表示不自动停止")
+
+        unit = self.bandwidth_unit_var.get().strip()
+        if unit not in ("Kbps", "Mbps"):
+            raise ValueError("带宽单位必须选择 Kbps 或 Mbps")
+        multiplier = 1000.0 if unit == "Kbps" else 1000000.0
+        filter_text = self._build_filter()
+        NetworkWorker.validate_filter(filter_text)
+        return {
+            "delay": delay,
+            "jitter": jitter,
+            "loss": loss,
+            "reorder": reorder,
+            "upload_bps": upload * multiplier,
+            "download_bps": download * multiplier,
+            "upload_display": upload,
+            "download_display": download,
+            "bandwidth_unit": unit,
+            "burst_trigger": burst_trigger,
+            "burst_length": burst_length,
+            "duration_seconds": duration_minutes * 60.0,
+            "duration_minutes": duration_minutes,
+            "filter_text": filter_text,
+        }
+
+    def _network_has_global_scope(self):
+        return not self.target_ip_var.get().strip() and not self.advanced_filter_var.get().strip()
+
+    def _network_risk_warnings(self, config):
+        warnings = []
+        if self._network_has_global_scope():
+            warnings.append("目标 IP 和高级规则均为空，将影响本机全部匹配流量")
+        if config["loss"] >= 50:
+            warnings.append(f"随机丢包概率较高：{config['loss']}%")
+        if config["reorder"] > 0:
+            warnings.append(f"已主动启用数据包乱序：{config['reorder']}%")
+        if config["burst_trigger"] >= 20 or config["burst_length"] >= 10:
+            warnings.append(
+                f"突发丢包强度较高：{config['burst_trigger']}% 概率连续丢 {config['burst_length']} 包"
+            )
+        limited_rates = [
+            rate for rate in (config["upload_bps"], config["download_bps"]) if rate > 0
+        ]
+        if limited_rates and min(limited_rates) <= 128000:
+            warnings.append("带宽限制低于或等于 128 Kbps，可能造成明显断流或超时")
+        if config["delay"] >= 3000:
+            warnings.append("单向基础延迟达到 3000ms 以上，可能触发大量请求超时")
+        return warnings
 
     def toggle_network(self):
         snapshot = self._task_snapshot("network")
@@ -2919,11 +3731,52 @@ class XiaoXinAssistant(ctk.CTk):
             self.network.stop()
         else:
             try:
-                delay, loss, filter_text = self._parse_network_config()
+                config = self._parse_network_config()
+                warnings = self._network_risk_warnings(config)
+                if warnings:
+                    confirmed = messagebox.askyesno(
+                        "确认弱网模拟范围与风险",
+                        "启动前请确认：\n\n- "
+                        + "\n- ".join(warnings)
+                        + f"\n\n最终生效规则：\n{config['filter_text']}\n\n是否继续启动？",
+                        icon="warning",
+                    )
+                    if not confirmed:
+                        self._network_log("已取消启动：用户未确认模拟范围或高风险参数")
+                        return
                 self._set_task_phase("network", TaskPhase.STARTING, "正在初始化 WinDivert")
-                self.network.start(delay, loss, filter_text)
-                self._network_log(f"正在启动：延迟 {delay}ms，丢包 {loss}%")
-                self._network_log(f"当前规则：{filter_text}")
+                self.network.start(
+                    config["delay"],
+                    config["loss"],
+                    config["filter_text"],
+                    jitter_ms=config["jitter"],
+                    reorder_percent=config["reorder"],
+                    upload_bps=config["upload_bps"],
+                    download_bps=config["download_bps"],
+                    burst_trigger_percent=config["burst_trigger"],
+                    burst_length=config["burst_length"],
+                    auto_stop_seconds=config["duration_seconds"],
+                )
+                self._network_log(
+                    f"正在启动：单向延迟 {config['delay']}±{config['jitter']}ms，"
+                    f"随机丢包 {config['loss']}%，乱序 {config['reorder']}%"
+                )
+                if self.direction_var.get() == "全部":
+                    self._network_log(
+                        f"上下行同时生效，预计额外 RTT 约 {config['delay'] * 2}ms（不含抖动）"
+                    )
+                if config["upload_bps"] or config["download_bps"]:
+                    self._network_log(
+                        f"带宽限制：上行 {config['upload_display']:g} {config['bandwidth_unit']}，"
+                        f"下行 {config['download_display']:g} {config['bandwidth_unit']}（0 = 不限速）"
+                    )
+                if config["burst_trigger"]:
+                    self._network_log(
+                        f"突发丢包：{config['burst_trigger']}% 概率触发，连续丢弃 {config['burst_length']} 包"
+                    )
+                if config["duration_minutes"]:
+                    self._network_log(f"将在 {config['duration_minutes']:g} 分钟后自动恢复正常网络")
+                self._network_log(f"最终生效规则：{config['filter_text']}")
             except Exception as exc:
                 self._set_task_phase("network", TaskPhase.FAILED, str(exc))
                 messagebox.showerror("启动失败", str(exc))
@@ -8485,10 +9338,51 @@ ID 缺失/多出：以 EN 优先作为基准，检查其他语言页是否缺少
             pass
 
     # ---------- Common ----------
+    @staticmethod
+    def _format_network_duration(seconds):
+        total = max(0, int(seconds or 0))
+        hours, remainder = divmod(total, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
+
+    @staticmethod
+    def _format_network_rate(bits_per_second):
+        value = max(0.0, float(bits_per_second or 0))
+        if value >= 1000000:
+            return f"{value / 1000000:.2f} Mbps"
+        if value >= 1000:
+            return f"{value / 1000:.1f} Kbps"
+        return f"{value:.0f} bps"
+
+    @staticmethod
+    def _format_network_bytes(byte_count):
+        value = max(0.0, float(byte_count or 0))
+        if value >= 1024 * 1024:
+            return f"{value / (1024 * 1024):.1f} MB"
+        if value >= 1024:
+            return f"{value / 1024:.1f} KB"
+        return f"{value:.0f} B"
+
     def _tick_stats(self):
         if self.is_exiting:
             return
-        self.network_stats_var.set(f"捕获 {self.network.captured_count} ｜ 丢弃 {self.network.dropped_count} ｜ 放行 {self.network.sent_count}")
+        stats = self.network.stats_snapshot()
+        duration = self._format_network_duration(stats["elapsed_seconds"])
+        remaining = (
+            self._format_network_duration(stats["remaining_seconds"])
+            if stats["auto_stop_enabled"]
+            else "--"
+        )
+        self.network_stats_var.set(
+            f"捕获 {stats['captured']} ｜ 放行 {stats['sent']} ｜ 随机丢包 {stats['random_drop']} ｜ "
+            f"突发丢包 {stats['burst_drop']} ｜ 乱序 {stats['reordered']}\n"
+            f"限速等待 {stats['bandwidth_wait']} ｜ 队列 {stats['queue_count']}/峰值 {stats['peak_queue_count']} "
+            f"（{self._format_network_bytes(stats['queue_bytes'])}）｜ 溢出 {stats['queue_overflow']} ｜ "
+            f"发送失败 {stats['send_failure']} ｜ 停止取消 {stats['cancelled']}\n"
+            f"上行 {self._format_network_rate(stats['upload_bps'])} ｜ "
+            f"下行 {self._format_network_rate(stats['download_bps'])} ｜ "
+            f"丢包率 {stats['loss_rate']:.2f}% ｜ 剩余 {remaining} ｜ 运行 {duration}"
+        )
         self._sync_legacy_task_states()
         self._refresh_current_task_ui()
 

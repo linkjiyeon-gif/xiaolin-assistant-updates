@@ -1,18 +1,16 @@
 {
-  "version": "2.4.36",
-  "build": 2436,
-  "published_at": "2026-07-15",
-  "installer_url": "https://github.com/linkjiyeon-gif/xiaolin-assistant-updates/releases/download/v2.4.36/XiaoLinAssistant_Setup_v2.4.36.exe",
-  "size": 35577244,
-  "sha256": "62c25e0b485ffd32a48d0bc78a3a84016d72c88c2e42771016a351cbbc6a584a",
+  "version": "2.4.39",
+  "build": 2439,
+  "published_at": "2026-08-10",
+  "installer_url": "https://github.com/linkjiyeon-gif/xiaolin-assistant-updates/releases/download/v2.4.39/XiaoLinAssistant_Setup_v2.4.39.exe",
+  "size": 35628085,
+  "sha256": "93c650aa4441417245ffd1ff7a4842310f69150fffff9096a38a354500305e7d",
   "release_notes": [
-    "支持多文件语言字典和自由选择源语言，增强多 Sheet 翻译表及大文件识别",
-    "优化占位符、富文本标签、换行、特殊符号和源文本检查，减少误报与重复问题",
-    "优化等级、序数、范围、连字符、Excel 日期和本地化数值比较规则",
-    "整列未翻译改为语言覆盖状态汇总，个别空翻译继续逐行检查",
-    "报告按明确问题、源文本问题、需人工确认和语言覆盖范围分类，并自动筛选和冻结表头",
-    "修复主键 ID 带 .0 以及 #NAME? 被 Excel 识别为错误单元格的问题",
-    "ADB 设备列表和详情新增分辨率显示，支持 Physical 与 Override 分辨率",
-    "多设备按 Serial 独立查询分辨率，增加失败回退、缓存和异步刷新机制"
+    "网络弱网默认按连接保持数据包顺序，延迟抖动不再隐式产生乱序，并支持独立设置主动乱序概率",
+    "新增上行和下行独立带宽限制，支持 Kbps、Mbps 及多连接公平调度",
+    "新增突发丢包模式，与随机丢包分别配置和统计",
+    "新增自动停止时间和立即恢复网络，异常或测试结束时安全释放 WinDivert、线程及队列",
+    "基础设置与进阶模拟分区展示，使用说明和运行日志独立显示，并增加低带宽等弱网预设",
+    "完善重注入保护、队列容量控制、收发异常处理以及实时速度、丢包和队列统计"
   ]
 }
