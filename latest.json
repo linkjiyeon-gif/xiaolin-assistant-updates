@@ -1,16 +1,16 @@
 {
-  "version": "2.4.38",
-  "build": 2438,
-  "published_at": "2026-08-04",
-  "installer_url": "https://github.com/linkjiyeon-gif/xiaolin-assistant-updates/releases/download/v2.4.38/XiaoLinAssistant_Setup_v2.4.38.exe",
-  "size": 35603291,
-  "sha256": "1237c0bf637e8dbc33b45033333791ea69170a5b6775f872ce96c55169955cdd",
+  "version": "2.4.39",
+  "build": 2439,
+  "published_at": "2026-08-10",
+  "installer_url": "https://github.com/linkjiyeon-gif/xiaolin-assistant-updates/releases/download/v2.4.39/XiaoLinAssistant_Setup_v2.4.39.exe",
+  "size": 35628085,
+  "sha256": "93c650aa4441417245ffd1ff7a4842310f69150fffff9096a38a354500305e7d",
   "release_notes": [
-    "多语言检查可根据文件名推荐本次目标语言，并在报告中记录实际检查范围",
-    "重复表头、子表头和非文本流程控制行不再误报为空翻译、空源文或无效 ID",
-    "修复 todo、todos、metodo 等自然语言被误识别为未完成占位文本的问题",
-    "完善 Excel 短日期格式、数字词、本地化月份、换行格式符和注册标签检查",
-    "译文复用分析改为默认关闭的低置信度辅助项，不计入明确错误总数",
-    "报告新增源文本问题、人工确认、语言覆盖和译文复用等分类，所有明细自带筛选"
+    "网络弱网默认按连接保持数据包顺序，延迟抖动不再隐式产生乱序，并支持独立设置主动乱序概率",
+    "新增上行和下行独立带宽限制，支持 Kbps、Mbps 及多连接公平调度",
+    "新增突发丢包模式，与随机丢包分别配置和统计",
+    "新增自动停止时间和立即恢复网络，异常或测试结束时安全释放 WinDivert、线程及队列",
+    "基础设置与进阶模拟分区展示，使用说明和运行日志独立显示，并增加低带宽等弱网预设",
+    "完善重注入保护、队列容量控制、收发异常处理以及实时速度、丢包和队列统计"
   ]
 }
