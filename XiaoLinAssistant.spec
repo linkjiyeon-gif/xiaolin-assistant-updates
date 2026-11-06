@@ -2,7 +2,7 @@
 from PyInstaller.utils.hooks import collect_dynamic_libs
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('assets', 'assets'), ('tools', 'tools'), ('version.json', '.')]
+datas = [('assets', 'assets'), ('version.json', '.')]
 binaries = []
 hiddenimports = ['pystray', 'pystray._win32', 'pydivert', 'pynput.keyboard._win32', 'pynput.mouse._win32', 'docx', 'openpyxl', 'PyPDF2', 'yaml', 'app.adb_tools', 'app.apk_info', 'app.log_monitor', 'app.crash_analyzer', 'app.localization_checker', 'app.localization_sheet_parser', 'app.config_validator', 'app.config_rule_templates', 'app.config_quick_rules', 'app.admin_utils', 'app.ios_log_tools', 'app.time_tools', 'app.value_config_compare', 'app.update_manager']
 binaries += collect_dynamic_libs('pydivert')
@@ -46,5 +46,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['assets\\app.ico'],
+    icon=['assets\app.ico'],
 )

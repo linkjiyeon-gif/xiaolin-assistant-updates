@@ -2,7 +2,6 @@ import ctypes
 from collections import deque
 from dataclasses import dataclass
 import heapq
-import ipaddress
 import json
 import itertools
 import os
@@ -40,6 +39,7 @@ from app.value_config_compare import (
     prepare_value_compare_options,
 )
 from app.admin_utils import is_windows_admin, relaunch_current_process_as_admin
+from app.network_filter import build_ip_condition, parse_ip_targets, summarize_ip_targets
 from app.ios_log_tools import (
     DEFAULT_IOS_KEYWORDS,
     IOSLogFilter,
@@ -162,7 +162,7 @@ ADB_CMD_TIMEOUT = 10
 
 NETWORK_USAGE_GUIDE = """使用说明
 1. 权限准备：先点击左下角“管理员重启”，右上角显示“已就绪”后再使用。
-2. 选择范围：目标 IP 建议填写要测试的服务器 IP；留空会影响本机全部匹配流量，启动前会再次确认。
+2. 选择范围：目标 IP 建议填写要测试的服务器 IP，可填多个（逗号 / 分号 / 空格分隔），支持网段 10.0.0.0/24 和范围 1.1.1.1-1.1.1.20；留空会影响本机全部匹配流量，启动前会再次确认。
 3. 设置参数：协议和方向不确定时保持“全部”；延迟是单向延迟，抖动表示延迟上下浮动，丢包填 0～100。
 4. 进阶模拟：带宽填 0 表示不限速；突发丢包用于模拟连续断流；乱序默认关闭，仅在专项测试时开启。
 5. 快速开始：可先选择“弱网测试”或“移动网络”预设，再点击“开始模拟”。上下行同时生效时，额外 RTT 约为基础延迟的两倍。
@@ -413,6 +413,8 @@ class NetworkWorker:
         except Exception as exc:
             raise ValueError(f"WinDivert 规则校验失败：{exc}") from exc
         if not valid:
+            if "too long" in str(error or "").lower():
+                raise ValueError("规则过长，超出 WinDivert 长度限制。\n请减少目标 IP 数量，或把连续的 IP 合并为网段 / 范围（如 10.0.0.0/24）。")
             position_text = f"，位置 {position}" if position is not None else ""
             raise ValueError(f"高级规则语法无效{position_text}：{error or '无法解析过滤表达式'}")
         return True
@@ -1357,6 +1359,10 @@ COLOR_SUCCESS = ("#16A34A", "#22C55E")
 COLOR_WARNING = ("#F59E0B", "#FBBF24")
 UI_MAX_RENDER_ROWS = 3000
 UI_PAGE_SIZE = 200
+# 运行日志文本框最多保留的行数，超出后删除最早的行，避免长时间运行越来越卡。
+LOG_BOX_MAX_LINES = 2000
+# iOS 实时日志批量写入界面的间隔（毫秒）。
+IOS_LOG_FLUSH_MS = 150
 
 
 class XiaoXinAssistant(ctk.CTk):
@@ -1414,6 +1420,7 @@ class XiaoXinAssistant(ctk.CTk):
         self.log_hit_records = []
         self.crash_records = []
         self._log_analysis_last_refresh = 0.0
+        self._log_analysis_refresh_pending = False
         self.adb_tools = ADBTools(app_data_path(""))
         self.adb_log = ADBLogWorker(self._adb_log, self._set_adb_status, self._set_adb_file, self._on_live_log_line, adb_tools=self.adb_tools)
 
@@ -1421,6 +1428,9 @@ class XiaoXinAssistant(ctk.CTk):
         self.click_button_var = tk.StringVar(value="left")
         self.click_interval_var = tk.StringVar(value="极速模式（每秒100次）")
         self.hotkey_var = tk.StringVar(value="F8")
+        # 全局热键监听线程每次按键都会读取热键，这里保存快照，避免跨线程访问 Tk 变量。
+        self._hotkey_name = "F8"
+        self.hotkey_var.trace_add("write", lambda *_: setattr(self, "_hotkey_name", self.hotkey_var.get()))
         self.clicker_status_var = tk.StringVar(value="运行状态：待命")
         self.clicker_custom_interval = 0.01
 
@@ -1714,8 +1724,20 @@ class XiaoXinAssistant(ctk.CTk):
         self.ios_log_thread = None
         self.ios_log_full_path = ""
         self.ios_log_filtered_path = ""
-        self.ios_display_lines = []
         self.ios_max_display_lines = 3000
+        self.ios_display_lines = deque(maxlen=self.ios_max_display_lines)
+        # iOS 抓取线程只把新行放进待写队列，由主线程按 IOS_LOG_FLUSH_MS 批量写入界面。
+        self._ios_lines_lock = threading.Lock()
+        self._ios_pending_lines = []
+        self._ios_flush_scheduled = False
+        # 后台日志线程读取的设置快照。Tk 变量只能在主线程访问，
+        # 逐行跨线程读取会让主线程排队等待，日志量大时界面明显卡顿。
+        self._log_analysis_enabled = True
+        self._log_pkg_name = DEFAULT_PKG_NAME
+        self._ios_filter_text = ""
+        for var in (self.log_analysis_enabled_var, self.log_pkg_var, self.ios_filter_text_var):
+            var.trace_add("write", lambda *_: self._sync_log_worker_settings())
+        self._sync_log_worker_settings()
         self.ios_keyword_vars = {keyword: tk.BooleanVar(value=True) for keyword in DEFAULT_IOS_KEYWORDS}
         self.ios_custom_keywords_textbox = None
         self.ios_devices_box = None
@@ -1769,7 +1791,7 @@ class XiaoXinAssistant(ctk.CTk):
         self._setup_tray()
         threading.Thread(
             target=self.clicker.setup_hotkey,
-            args=(lambda: self.hotkey_var.get(), lambda: self.after(0, self.toggle_clicker)),
+            args=(lambda: self._hotkey_name, lambda: self.after(0, self.toggle_clicker)),
             daemon=True,
         ).start()
         self._tick_stats()
@@ -2510,6 +2532,9 @@ class XiaoXinAssistant(ctk.CTk):
             self._set_badge(self.adb_log.running.is_set())
             if needs_build:
                 self._build_log_analysis_page()
+            else:
+                # 不在本页时实时命中只记录不渲染，切回来补一次刷新。
+                self._refresh_log_analysis_views()
         elif key == "adb_tools":
             self.page_title.configure(text="ADB 工具")
             self.page_subtitle.configure(text="设备检测、截图录屏、应用管理和 APK 信息查看")
@@ -3358,7 +3383,7 @@ class XiaoXinAssistant(ctk.CTk):
             return entry
 
         self.network_parameter_widgets.append(
-            inline_entry(basic_tab, 0, 0, "目标 IP", self.target_ip_var, "留空 = 全部流量")
+            inline_entry(basic_tab, 0, 0, "目标 IP（可填多个）", self.target_ip_var, "留空 = 全部；多个用逗号分隔")
         )
         self.network_parameter_widgets.append(
             inline_entry(basic_tab, 0, 1, "高级规则", self.advanced_filter_var, "可选，自动加安全保护")
@@ -3629,13 +3654,10 @@ class XiaoXinAssistant(ctk.CTk):
         elif direction == "入站":
             parts.append("inbound")
 
-        target_ip = self.target_ip_var.get().strip()
-        if target_ip:
-            ip_obj = ipaddress.ip_address(target_ip)
-            if ip_obj.version == 4:
-                parts.append(f"(ip.SrcAddr == {target_ip} or ip.DstAddr == {target_ip})")
-            else:
-                parts.append(f"(ipv6.SrcAddr == {target_ip} or ipv6.DstAddr == {target_ip})")
+        # 支持多个目标：单个 IP、网段（CIDR）或范围，逗号 / 分号 / 空格分隔。
+        ip_condition = build_ip_condition(parse_ip_targets(self.target_ip_var.get()))
+        if ip_condition:
+            parts.append(ip_condition)
 
         return ensure_windivert_impostor_guard(" and ".join(parts) if parts else "true")
 
@@ -3696,7 +3718,7 @@ class XiaoXinAssistant(ctk.CTk):
         }
 
     def _network_has_global_scope(self):
-        return not self.target_ip_var.get().strip() and not self.advanced_filter_var.get().strip()
+        return not parse_ip_targets(self.target_ip_var.get()) and not self.advanced_filter_var.get().strip()
 
     def _network_risk_warnings(self, config):
         warnings = []
@@ -3776,19 +3798,31 @@ class XiaoXinAssistant(ctk.CTk):
                     )
                 if config["duration_minutes"]:
                     self._network_log(f"将在 {config['duration_minutes']:g} 分钟后自动恢复正常网络")
+                if not self.advanced_filter_var.get().strip():
+                    self._network_log(f"目标：{summarize_ip_targets(self.target_ip_var.get())}")
                 self._network_log(f"最终生效规则：{config['filter_text']}")
             except Exception as exc:
                 self._set_task_phase("network", TaskPhase.FAILED, str(exc))
                 messagebox.showerror("启动失败", str(exc))
         self._refresh_network_button()
 
+    def _append_log_box_text(self, box, text, max_lines=LOG_BOX_MAX_LINES):
+        """Append text to a read-only log textbox and drop the oldest lines beyond max_lines."""
+        box.configure(state="normal")
+        box.insert("end", text)
+        try:
+            line_count = int(str(box.index("end-1c")).split(".")[0])
+            if line_count > max_lines:
+                box.delete("1.0", f"{line_count - max_lines + 1}.0")
+        except Exception:
+            pass
+        box.see("end")
+        box.configure(state="disabled")
+
     def _network_log(self, text):
         def write():
             if hasattr(self, "network_log_box") and self.network_log_box.winfo_exists():
-                self.network_log_box.configure(state="normal")
-                self.network_log_box.insert("end", f"[{time.strftime('%H:%M:%S')}] {text}\n")
-                self.network_log_box.see("end")
-                self.network_log_box.configure(state="disabled")
+                self._append_log_box_text(self.network_log_box, f"[{time.strftime('%H:%M:%S')}] {text}\n")
         try:
             self.after(0, write)
         except Exception:
@@ -4412,10 +4446,7 @@ class XiaoXinAssistant(ctk.CTk):
     def _adb_log(self, text):
         def write():
             if hasattr(self, "adb_log_box") and self.adb_log_box.winfo_exists():
-                self.adb_log_box.configure(state="normal")
-                self.adb_log_box.insert("end", f"[{time.strftime('%H:%M:%S')}] {text}\n")
-                self.adb_log_box.see("end")
-                self.adb_log_box.configure(state="disabled")
+                self._append_log_box_text(self.adb_log_box, f"[{time.strftime('%H:%M:%S')}] {text}\n")
         try:
             self.after(0, write)
         except Exception:
@@ -4559,12 +4590,22 @@ class XiaoXinAssistant(ctk.CTk):
         self.log_monitor.configure(self._get_log_analysis_keywords(), context_lines=context_lines)
         self.log_analysis_status_var.set(f"已应用关键字配置：{len(self.log_monitor.keywords)} 个关键字，上下文前后各 {context_lines} 行")
 
+    def _sync_log_worker_settings(self):
+        """Copy Tk vars read by log worker threads into plain attributes (main thread only)."""
+        try:
+            self._log_analysis_enabled = bool(self.log_analysis_enabled_var.get())
+            self._log_pkg_name = self.log_pkg_var.get().strip()
+            self._ios_filter_text = self.ios_filter_text_var.get().strip()
+        except Exception:
+            pass
+
     def _on_live_log_line(self, line: str):
-        if not self.log_analysis_enabled_var.get():
+        # 运行在 ADB 抓取线程中：只读快照属性，不访问 Tk 变量。
+        if not self._log_analysis_enabled:
             return
         try:
             new_hits = self.log_monitor.feed_line(line)
-            new_crashes = self.crash_stream_detector.feed_line(line, fallback_package=self.log_pkg_var.get().strip())
+            new_crashes = self.crash_stream_detector.feed_line(line, fallback_package=self._log_pkg_name)
             if new_hits or new_crashes:
                 self.log_hit_records = self.log_monitor.get_hits()
                 self.crash_records = self.crash_stream_detector.get_records()
@@ -4573,14 +4614,22 @@ class XiaoXinAssistant(ctk.CTk):
             pass
 
     def _schedule_log_analysis_refresh(self):
-        now = time.monotonic()
-        if now - self._log_analysis_last_refresh < 0.5:
+        # 多次命中合并成一次刷新，最多每 0.5 秒一次；最后一批命中也会补刷，不会被丢掉。
+        if self._log_analysis_refresh_pending:
             return
-        self._log_analysis_last_refresh = now
+        self._log_analysis_refresh_pending = True
+        wait = 0.5 - (time.monotonic() - self._log_analysis_last_refresh)
         try:
-            self.after(0, self._refresh_log_analysis_views)
+            self.after(max(0, int(wait * 1000)), self._run_scheduled_log_analysis_refresh)
         except Exception:
-            pass
+            self._log_analysis_refresh_pending = False
+
+    def _run_scheduled_log_analysis_refresh(self):
+        self._log_analysis_refresh_pending = False
+        self._log_analysis_last_refresh = time.monotonic()
+        # 不在日志分析页时不重写结果框，切回该页时再刷新。
+        if self.current_page == "log_analysis":
+            self._refresh_log_analysis_views()
 
     def _refresh_log_analysis_views(self):
         if hasattr(self, "log_hits_box") and self.log_hits_box and self.log_hits_box.winfo_exists():
@@ -5203,10 +5252,7 @@ class XiaoXinAssistant(ctk.CTk):
         line = f"[{time.strftime('%H:%M:%S')}] {text}\n"
         def write():
             if hasattr(self, "adb_tools_log_box") and self.adb_tools_log_box.winfo_exists():
-                self.adb_tools_log_box.configure(state="normal")
-                self.adb_tools_log_box.insert("end", line)
-                self.adb_tools_log_box.see("end")
-                self.adb_tools_log_box.configure(state="disabled")
+                self._append_log_box_text(self.adb_tools_log_box, line)
         try:
             self.after(0, write)
         except Exception:
@@ -5514,7 +5560,7 @@ class XiaoXinAssistant(ctk.CTk):
         ctk.CTkLabel(tool_card, text="iOS 工具路径配置", text_color=COLOR_TEXT, font=self._font(18, "bold")).grid(row=0, column=0, sticky="w", padx=24, pady=(18, 8), columnspan=3)
         ctk.CTkLabel(
             tool_card,
-            text="依赖 libimobiledevice。本工具不内置第三方 exe，可放到 tools/ios/ 或手动选择路径。",
+            text="依赖 libimobiledevice。安装包已内置到程序目录 tools/ios，也可手动选择其他路径。",
             text_color=COLOR_MUTED,
             font=self._font(13),
             wraplength=760,
@@ -5733,7 +5779,8 @@ class XiaoXinAssistant(ctk.CTk):
             messagebox.showerror("启动失败", str(exc))
             return
 
-        self.ios_display_lines.clear()
+        with self._ios_lines_lock:
+            self.ios_display_lines.clear()
         self.ios_log_running.set()
         self.ios_status_var.set("正在抓取 iOS 日志")
         self.ios_log_file_var.set(f"完整日志：{self.ios_log_full_path}\n过滤日志：{self.ios_log_filtered_path}")
@@ -5795,33 +5842,39 @@ class XiaoXinAssistant(ctk.CTk):
     def _append_ios_log_line(self, line: str, hit: bool = False):
         prefix = "[命中] " if hit else ""
         text = prefix + line
-        self.ios_display_lines.append(text)
-        if len(self.ios_display_lines) > self.ios_max_display_lines:
-            self.ios_display_lines = self.ios_display_lines[-self.ios_max_display_lines:]
-        def write():
-            if hasattr(self, "ios_log_box") and self.ios_log_box and self.ios_log_box.winfo_exists():
-                self.ios_log_box.configure(state="normal")
-                self.ios_log_box.insert("end", text + "\n")
-                # Trim UI occasionally to avoid very large widget content.
-                if len(self.ios_display_lines) == self.ios_max_display_lines:
-                    self.ios_log_box.delete("1.0", "200.0")
-                self.ios_log_box.see("end")
-                self.ios_log_box.configure(state="disabled")
+        # 可能运行在 iOS 抓取线程中：只入队，由主线程定时批量写入，避免每行都排一次界面刷新。
+        with self._ios_lines_lock:
+            self.ios_display_lines.append(text)
+            self._ios_pending_lines.append(text)
+            if self._ios_flush_scheduled:
+                return
+            self._ios_flush_scheduled = True
         try:
-            self.after(0, write)
+            self.after(IOS_LOG_FLUSH_MS, self._flush_ios_log_lines)
         except Exception:
-            pass
+            with self._ios_lines_lock:
+                self._ios_flush_scheduled = False
+
+    def _flush_ios_log_lines(self):
+        with self._ios_lines_lock:
+            pending = self._ios_pending_lines[-self.ios_max_display_lines:]
+            self._ios_pending_lines = []
+            self._ios_flush_scheduled = False
+        if not pending:
+            return
+        if hasattr(self, "ios_log_box") and self.ios_log_box and self.ios_log_box.winfo_exists():
+            self._append_log_box_text(self.ios_log_box, "\n".join(pending) + "\n", max_lines=self.ios_max_display_lines)
 
     def ios_append_system_log(self, text: str):
         self._append_ios_log_line(f"[{time.strftime('%H:%M:%S')}] {text}", hit=False)
 
     def _on_ios_live_log_line(self, line: str):
-        if not self.log_analysis_enabled_var.get():
+        # 运行在 iOS 抓取线程中：只读快照属性，不访问 Tk 变量。
+        if not self._log_analysis_enabled:
             return
         try:
             new_hits = self.log_monitor.feed_line(line)
-            fallback = self.ios_filter_text_var.get().strip()
-            new_crashes = self.crash_stream_detector.feed_line(line, fallback_package=fallback)
+            new_crashes = self.crash_stream_detector.feed_line(line, fallback_package=self._ios_filter_text)
             if new_hits or new_crashes:
                 self.log_hit_records = self.log_monitor.get_hits()
                 self.crash_records = self.crash_stream_detector.get_records()
@@ -5839,16 +5892,20 @@ class XiaoXinAssistant(ctk.CTk):
             )
 
     def ios_copy_current_log(self):
-        text = "\n".join(self.ios_display_lines)
+        with self._ios_lines_lock:
+            lines = list(self.ios_display_lines)
+        text = "\n".join(lines)
         if not text:
             messagebox.showinfo("提示", "当前没有可复制的 iOS 日志")
             return
         self.clipboard_clear()
         self.clipboard_append(text)
-        messagebox.showinfo("已复制", f"已复制 {len(self.ios_display_lines)} 行 iOS 日志")
+        messagebox.showinfo("已复制", f"已复制 {len(lines)} 行 iOS 日志")
 
     def ios_clear_display(self):
-        self.ios_display_lines.clear()
+        with self._ios_lines_lock:
+            self.ios_display_lines.clear()
+            self._ios_pending_lines = []
         if hasattr(self, "ios_log_box") and self.ios_log_box and self.ios_log_box.winfo_exists():
             self._set_textbox_text(self.ios_log_box, "")
 
@@ -5882,7 +5939,7 @@ class XiaoXinAssistant(ctk.CTk):
                 with open(path, "r", encoding="utf-8", errors="ignore") as file:
                     lines = file.readlines()
                 hits = self.log_monitor.analyze_lines(lines)
-                crashes = self.crash_file_analyzer.analyze_lines(lines, fallback_package=self.ios_filter_text_var.get().strip())
+                crashes = self.crash_file_analyzer.analyze_lines(lines, fallback_package=self._ios_filter_text)
                 def ok():
                     self.log_hit_records = hits
                     self.crash_records = crashes
