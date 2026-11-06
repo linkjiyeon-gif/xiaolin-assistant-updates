@@ -107,16 +107,16 @@ python xiaoxin_assistant.py
 - INSTALL_AND_FIRST_USE.txt
 - assets\app.ico
 - assets\app.png
-- tools\ios\README.txt
+- tools\ios\ 目录下的全部 iOS 工具（exe 及其依赖 dll）和 README.txt
 
-注意：
-安装包默认不会内置第三方 iOS 工具 exe，例如：
+说明：
+安装包已内置 libimobiledevice iOS 工具，安装后位于 {安装目录}\tools\ios\，例如：
 - idevice_id.exe
 - ideviceinfo.exe
 - idevicesyslog.exe
 - idevicecrashreport.exe
 
-如需使用 iOS 日志抓取，请用户自行下载 libimobiledevice 工具，并在工具箱内配置路径。
+安装后无需另外下载即可使用 iOS 日志抓取；工具箱会自动检测程序目录下的 tools\ios。
 
 
 八、管理员权限说明
@@ -158,11 +158,11 @@ adb devices
 十、iOS 日志功能配置
 --------------------
 
-iOS 日志抓取依赖用户本地安装的 libimobiledevice 工具。
+iOS 日志抓取依赖 libimobiledevice 工具。安装包已内置这些工具，默认目录：
 
-建议工具目录：
+   {安装目录}\tools\ios\
 
-   tools\ios\
+如需替换为其他版本，可覆盖该目录下的文件，或在“iOS 日志”页面手动选择工具路径。
 
 可配置工具：
 - idevice_id.exe
@@ -246,7 +246,7 @@ Windows 还需要能识别 iPhone / iPad，通常需要安装 Apple Mobile Devic
 注意：
 - 安装程序本身不联网、不上传数据。
 - 工具运行时也不会上传测试文件、日志或配置表。
-- iOS 第三方工具 exe 不默认内置，需要用户自行配置。
+- 安装包已内置 iOS 工具（tools\ios），同事安装后无需另外配置。
 
 
 补充说明：
