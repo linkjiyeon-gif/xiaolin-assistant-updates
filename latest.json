@@ -1,16 +1,16 @@
 {
-  "version": "2.4.39",
-  "build": 2439,
-  "published_at": "2026-08-10",
-  "installer_url": "https://github.com/linkjiyeon-gif/xiaolin-assistant-updates/releases/download/v2.4.39/XiaoLinAssistant_Setup_v2.4.39.exe",
-  "size": 35628085,
-  "sha256": "93c650aa4441417245ffd1ff7a4842310f69150fffff9096a38a354500305e7d",
+  "version": "2.4.40",
+  "build": 2440,
+  "published_at": "2026-11-06",
+  "installer_url": "https://github.com/linkjiyeon-gif/xiaolin-assistant-updates/releases/download/v2.4.40/XiaoLinAssistant_Setup_v2.4.40.exe",
+  "size": 44161291,
+  "sha256": "e6b6c0b1077abfc6a70114918a72b1b1b6a6f0619070ae2e6557f97170bfb9f7",
   "release_notes": [
-    "网络弱网默认按连接保持数据包顺序，延迟抖动不再隐式产生乱序，并支持独立设置主动乱序概率",
-    "新增上行和下行独立带宽限制，支持 Kbps、Mbps 及多连接公平调度",
-    "新增突发丢包模式，与随机丢包分别配置和统计",
-    "新增自动停止时间和立即恢复网络，异常或测试结束时安全释放 WinDivert、线程及队列",
-    "基础设置与进阶模拟分区展示，使用说明和运行日志独立显示，并增加低带宽等弱网预设",
-    "完善重注入保护、队列容量控制、收发异常处理以及实时速度、丢包和队列统计"
+    "网络弱网支持同时拦截多个 IP，可填写网段和 IP 范围，启动前自动校验规则",
+    "优化 ADB / iOS 日志抓取时的界面流畅度，日志量大时减少卡顿",
+    "修复 iOS 日志显示满 3000 行后内容被反复批量删除的问题",
+    "日志分析结果合并刷新，确保最后一批命中会显示",
+    "运行日志限制保留行数，避免长时间运行后变慢",
+    "安装包内置 iOS 工具，安装后无需额外配置"
   ]
 }
