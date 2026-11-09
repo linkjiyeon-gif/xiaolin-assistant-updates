@@ -12,11 +12,19 @@ REM setup.iss must include:
 REM Source: "..\tools\ios\*"; DestDir: "{app}\tools\ios"; Flags: ignoreversion recursesubdirs createallsubdirs
 REM The tools\ios folder should contain idevice_id.exe / ideviceinfo.exe / idevicesyslog.exe / idevicecrashreport.exe and required dll files.
 REM ============================================================
-IF NOT EXIST "%~dp0tools\ios" (
-    ECHO [WARN] tools\ios folder not found. iOS log tools will not be packaged into installer.
-) ELSE (
-    ECHO [OK] Found tools\ios folder. It will be packaged by installer/setup.iss.
+REM The iOS tool binaries are not stored in git. Copy them into tools\ios before building.
+set "IOS_MISSING="
+for %%F in (idevice_id.exe ideviceinfo.exe idevicesyslog.exe idevicecrashreport.exe) do (
+    IF NOT EXIST "%~dp0tools\ios\%%F" set "IOS_MISSING=1" & ECHO [ERROR] Missing tools\ios\%%F
 )
+IF NOT EXIST "%~dp0tools\ios\*.dll" set "IOS_MISSING=1" & ECHO [ERROR] No dll files found in tools\ios
+IF DEFINED IOS_MISSING (
+    ECHO [ERROR] iOS tools are missing. The iOS tool binaries are not stored in git.
+    ECHO         Copy the libimobiledevice exe and dll files into tools\ios, then build again.
+    pause
+    exit /b 3
+)
+ECHO [OK] Found iOS tools in tools\ios. They will be packaged by installer/setup.iss.
 
 setlocal EnableExtensions DisableDelayedExpansion
 chcp 65001 >nul 2>nul
