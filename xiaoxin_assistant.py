@@ -1,6 +1,7 @@
 import ctypes
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 import heapq
 import json
 import itertools
@@ -39,7 +40,7 @@ from app.value_config_compare import (
     prepare_value_compare_options,
 )
 from app.admin_utils import is_windows_admin, relaunch_current_process_as_admin
-from app.network_filter import build_ip_condition, parse_ip_targets, summarize_ip_targets
+from app.network_filter import build_ip_condition, describe_ip_targets, parse_ip_targets, summarize_ip_targets
 from app.ios_log_tools import (
     DEFAULT_IOS_KEYWORDS,
     IOSLogFilter,
@@ -107,6 +108,8 @@ from app.crash_analyzer import (
 )
 
 from app.time_tools import (
+    NAMED_TIMEZONES,
+    TIMEZONE_OPTIONS,
     add_or_subtract_time_parts,
     boundary_times,
     countdown,
@@ -162,9 +165,9 @@ ADB_CMD_TIMEOUT = 10
 
 NETWORK_USAGE_GUIDE = """使用说明
 1. 权限准备：先点击左下角“管理员重启”，右上角显示“已就绪”后再使用。
-2. 选择范围：目标 IP 建议填写要测试的服务器 IP，可填多个（逗号 / 分号 / 空格分隔），支持网段 10.0.0.0/24 和范围 1.1.1.1-1.1.1.20；留空会影响本机全部匹配流量，启动前会再次确认。
+2. 选择范围：目标 IP 建议填写要测试的服务器 IP，可填多个（每行一个，或用逗号 / 分号 / 空格分隔，可直接粘贴一列），支持网段 10.0.0.0/24 和范围 1.1.1.1-1.1.1.20；输入框下方会实时显示识别结果和格式错误。留空会影响本机全部匹配流量，启动前会再次确认。
 3. 设置参数：协议和方向不确定时保持“全部”；延迟是单向延迟，抖动表示延迟上下浮动，丢包填 0～100。
-4. 进阶模拟：带宽填 0 表示不限速；突发丢包用于模拟连续断流；乱序默认关闭，仅在专项测试时开启。
+4. 进阶模拟：带宽填 0 表示不限速；突发丢包用于模拟连续断流；乱序默认关闭，仅在专项测试时开启；高级规则（WinDivert 语法）也在这里，填写后会忽略目标 IP、协议和方向。
 5. 快速开始：可先选择“弱网测试”或“移动网络”预设，再点击“开始模拟”。上下行同时生效时，额外 RTT 约为基础延迟的两倍。
 6. 查看与结束：运行中观察速度、丢包、队列和失败统计；测试完成后点击“停止模拟”，紧急情况可点“立即恢复网络”。
 示例：基础延迟 300ms、抖动 50ms，表示每个方向约延迟 250～350ms；上下行都生效时额外 RTT 通常约 600ms。
@@ -234,8 +237,20 @@ class ClickerWorker:
         self.hotkey_getter = None
         self.toggle_callback = None
         self._last_hotkey_at = 0.0
+        # 运行统计（工作线程写，界面线程只读这几个数字）。
+        self.click_count = 0
+        self.started_at = 0.0
+        self.stopped_at = 0.0
+        self.stop_reason = ""
+        self.on_auto_stop = None  # 达到次数 / 时长上限自动停止时回调（在工作线程中调用）
 
-    def start(self, interval: float, button_name: str):
+    def elapsed_seconds(self) -> float:
+        if not self.started_at:
+            return 0.0
+        end = self.stopped_at if (self.stopped_at and not self.running.is_set()) else time.monotonic()
+        return max(0.0, end - self.started_at)
+
+    def start(self, interval: float, button_name: str, max_clicks: int = 0, max_seconds: float = 0):
         if self.running.is_set():
             return
         if self.mouse is None and _ensure_pynput_loaded():
@@ -250,21 +265,53 @@ class ClickerWorker:
         }.get(button_name, Button.left)
 
         interval = max(0.01, float(interval))
+        self.click_count = 0
+        self.started_at = time.monotonic()
+        self.stopped_at = 0.0
+        self.stop_reason = ""
         self.running.set()
-        self.thread = threading.Thread(target=self._loop, args=(interval, button), daemon=True)
+        self.thread = threading.Thread(
+            target=self._loop, args=(interval, button, max(0, int(max_clicks or 0)), max(0.0, float(max_seconds or 0))), daemon=True
+        )
         self.thread.start()
 
-    def stop(self):
+    def stop(self, reason: str = "手动停止"):
+        if self.running.is_set():
+            self.stop_reason = reason
+            self.stopped_at = time.monotonic()
         self.running.clear()
 
-    def _loop(self, interval, button):
+    def _loop(self, interval, button, max_clicks=0, max_seconds=0.0):
+        # 按固定节拍点击：下一次的时间点 = 上一次计划时间 + 间隔，点击本身的耗时不会累积成误差。
+        next_at = time.monotonic()
         while self.running.is_set():
+            if max_seconds and time.monotonic() - self.started_at >= max_seconds:
+                self._auto_stop(f"已运行 {max_seconds:g} 秒，自动停止")
+                break
             try:
                 self.mouse.click(button)
             except Exception:
-                self.running.clear()
+                self.stop("点击失败，已停止")
                 break
-            time.sleep(interval)
+            self.click_count += 1
+            if max_clicks and self.click_count >= max_clicks:
+                self._auto_stop(f"已点击 {max_clicks} 次，自动停止")
+                break
+            next_at += interval
+            delay = next_at - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                next_at = time.monotonic()  # 落后太多时不补点，避免突然连发
+
+    def _auto_stop(self, reason):
+        self.stop(reason)
+        callback = self.on_auto_stop
+        if callback:
+            try:
+                callback()
+            except Exception:
+                pass
 
     def setup_hotkey(self, hotkey_getter, toggle_callback):
         if not _ensure_pynput_loaded():
@@ -1342,6 +1389,40 @@ class ADBLogWorker:
 # ---------------- Main App ----------------
 FONT_FAMILY = "Microsoft YaHei UI"
 
+# ---------------- 界面规范（改版第 1 批起统一使用） ----------------
+# 字号 5 级：页面标题 / 卡片标题 / 正文 / 标签与按钮 / 说明文字
+TYPE_SCALE = {
+    "page_title": (22, "bold"),
+    "card_title": (16, "bold"),
+    "body": (13, "normal"),
+    "label": (13, "bold"),
+    "hint": (12, "normal"),
+}
+RADIUS_CARD = 14     # 卡片
+RADIUS_CONTROL = 10  # 输入框、按钮
+RADIUS_TAG = 8       # 小标签
+SPACE_CARD = 20      # 卡片内边距
+SPACE_GAP = 12       # 卡片之间
+SPACE_INLINE = 8     # 同一行控件之间
+BUTTON_HEIGHT = {"md": 40, "sm": 32}
+# Windows 10 / 11 自带的图标字体，按顺序取第一个可用的；都没有时退回到文字符号。
+ICON_FONT_CANDIDATES = ("Segoe Fluent Icons", "Segoe MDL2 Assets")
+# 导航与首页共用：(页面, 图标字体码位, 无图标字体时的符号, 名称, 首页说明)
+TOOL_ITEMS = [
+    ("home", "\ue80f", "▦", "工具箱", ""),
+    ("adb_tools", "\uec7a", "▣", "ADB 工具", "设备、截图录屏、应用管理"),
+    ("adb_log", "\ue8fd", "▤", "日志抓取", "抓取应用的 logcat 日志"),
+    ("log_analysis", "\ue9d9", "◇", "日志分析", "关键字监控、崩溃提取"),
+    ("ios_log", "\ue8ea", "◆", "iOS 日志", "抓取 iPhone / iPad 日志"),
+    ("time_tools", "\ue121", "时", "时间测试", "时间戳、时区、倒计时"),
+    ("network", "\ue701", "◎", "网络弱网", "延迟、抖动、丢包、限速"),
+    ("clicker", "\ue962", "⌁", "鼠标连点", "左中右键连点，热键启停"),
+    # 文件比对、配置表校验、多语言检查不再迭代维护，排在最后。
+    ("compare", "\ue8ab", "≋", "文件比对", "文档、配置、翻译表比对"),
+    ("config_validator", "\ue80a", "表", "配置表校验", "主键、必填、数值、枚举"),
+    ("localization", "\uf2b7", "文", "多语言检查", "空翻译、残留中文、占位符"),
+]
+
 COLOR_BG = ("#F4F7FB", "#0B1018")
 COLOR_SIDEBAR = ("#FFFFFF", "#111820")
 COLOR_SURFACE = ("#FFFFFF", "#151C26")
@@ -1363,6 +1444,16 @@ UI_PAGE_SIZE = 200
 LOG_BOX_MAX_LINES = 2000
 # iOS 实时日志批量写入界面的间隔（毫秒）。
 IOS_LOG_FLUSH_MS = 150
+# 时间戳转日期时“同时显示”的时区（本地和 UTC 结果里固定都有）。
+TIMEZONE_DISPLAY_OPTIONS = ["不额外显示", "UTC+8"] + list(NAMED_TIMEZONES)
+# 用页面按钮启动连点时先倒数几秒，留时间把鼠标移到目标位置（热键启动不倒数）。
+CLICK_START_COUNTDOWN = 3
+# 日志抓取页“实时日志”预览：保留最近多少行、多久批量写一次界面。
+ADB_LIVE_PREVIEW_LINES = 200
+ADB_LIVE_PREVIEW_FLUSH_MS = 300
+# 最近用过的应用包名（保存在程序目录，安装在用户目录下，可写）。
+RECENT_PACKAGES_FILE = "recent_packages.json"
+RECENT_PACKAGES_MAX = 8
 
 
 class XiaoXinAssistant(ctk.CTk):
@@ -1381,6 +1472,14 @@ class XiaoXinAssistant(ctk.CTk):
         self.minsize(1280, 760)
         self._center_window(self.default_window_width, self.default_window_height)
         self.configure(fg_color=COLOR_BG)
+        # 首次显示时 CTk 还要按真实尺寸重新排版、重画上百个圆角控件（约 1～2 秒），
+        # 先让窗口完全透明，画完后再显示，避免用户看到一块块刷新。
+        self._reveal_pending = False
+        try:
+            self.attributes("-alpha", 0.0)
+            self._reveal_pending = True
+        except Exception:
+            pass
 
         self._init_window_icon()
         self._page_cache = {}
@@ -1433,6 +1532,10 @@ class XiaoXinAssistant(ctk.CTk):
         self.hotkey_var.trace_add("write", lambda *_: setattr(self, "_hotkey_name", self.hotkey_var.get()))
         self.clicker_status_var = tk.StringVar(value="运行状态：待命")
         self.clicker_custom_interval = 0.01
+        self.click_max_count_var = tk.StringVar(value="0")
+        self.click_max_seconds_var = tk.StringVar(value="0")
+        self._click_countdown_left = 0
+        self._click_countdown_job = None
 
         # Network vars
         self.target_ip_var = tk.StringVar(value="")
@@ -1449,7 +1552,6 @@ class XiaoXinAssistant(ctk.CTk):
         self.burst_length_var = tk.StringVar(value="0")
         self.network_duration_var = tk.StringVar(value="0")
         self.advanced_filter_var = tk.StringVar(value="")
-        self.network_guide_visible = True
         self.network_status_var = tk.StringVar(value="运行状态：待命")
         self.network_delay_hint_var = tk.StringVar(value="单向延迟 100ms；全部方向预计额外 RTT 约 200ms")
         self.network_stats_var = tk.StringVar(
@@ -1718,6 +1820,8 @@ class XiaoXinAssistant(ctk.CTk):
         self.ios_status_var = tk.StringVar(value="待命")
         self.ios_log_file_var = tk.StringVar(value="未生成")
         self.ios_tool_status_var = tk.StringVar(value="未检测工具路径")
+        self.ios_tool_summary_var = tk.StringVar(value="正在检测…")
+        self._ios_auto_detect_done = False
         self.ios_busy = threading.Event()
         self.ios_log_running = threading.Event()
         self.ios_log_process = None
@@ -1730,6 +1834,11 @@ class XiaoXinAssistant(ctk.CTk):
         self._ios_lines_lock = threading.Lock()
         self._ios_pending_lines = []
         self._ios_flush_scheduled = False
+        # 日志抓取页实时预览：抓取线程只入队，主线程批量写；队列只保留最新的预览行数。
+        self._adb_live_lock = threading.Lock()
+        self._adb_live_pending = deque(maxlen=ADB_LIVE_PREVIEW_LINES)
+        self._adb_live_flush_scheduled = False
+        self._adb_live_preview_has_hint = True
         # 后台日志线程读取的设置快照。Tk 变量只能在主线程访问，
         # 逐行跨线程读取会让主线程排队等待，日志量大时界面明显卡顿。
         self._log_analysis_enabled = True
@@ -1745,6 +1854,10 @@ class XiaoXinAssistant(ctk.CTk):
 
         # Time test tool vars
         self.time_result_boxes = {}
+        self.time_copy_hints = {}
+        self._time_hint_jobs = {}
+        self._time_live_jobs = {}
+        self._time_ts_last_mode = "ts"
         self.time_default_tz_var = tk.StringVar(value="本地时区")
         self.time_custom_offset_var = tk.StringVar(value="+8")
         now_text = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1752,6 +1865,7 @@ class XiaoXinAssistant(ctk.CTk):
         self.time_ts_unit_var = tk.StringVar(value="自动识别")
         self.time_dt_input_var = tk.StringVar(value=now_text)
         self.time_dt_tz_var = tk.StringVar(value="本地时区")
+        self.time_ts_zone_var = tk.StringVar(value="不额外显示")
         self.time_unit_value_var = tk.StringVar(value="86400")
         self.time_unit_from_var = tk.StringVar(value="秒")
         self.time_diff_start_var = tk.StringVar(value=now_text)
@@ -1779,10 +1893,30 @@ class XiaoXinAssistant(ctk.CTk):
         # Theme vars
         self.theme_mode_var = tk.StringVar(value="深色模式")
 
+        self._detect_icon_font()
         self._build_ui()
-        self.after(50, self._finish_background_startup)
+        # 托盘、热键等后台初始化排在窗口显示之后，避免推迟首次显示。
+        self.after(0, self._reveal_main_window)
 
         self.protocol("WM_DELETE_WINDOW", self.on_close_window)
+
+    def _reveal_main_window(self):
+        """Finish the first layout and redraw while transparent, then show the window."""
+        try:
+            if self._reveal_pending:
+                self._reveal_pending = False
+                try:
+                    self.update_idletasks()
+                    self.update()
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        self.attributes("-alpha", 1.0)
+                    except Exception:
+                        pass
+        finally:
+            self.after(50, self._finish_background_startup)
 
     def _finish_background_startup(self):
         """Start non-visual helpers after Tk has painted its first frame."""
@@ -1852,6 +1986,53 @@ class XiaoXinAssistant(ctk.CTk):
             if isinstance(color_value, tuple):
                 return color_value[1]
             return color_value
+
+    def _t(self, kind):
+        """Font for one level of TYPE_SCALE, e.g. self._t("card_title")."""
+        size, weight = TYPE_SCALE[kind]
+        return self._font(size, weight)
+
+    def _icon_font(self, size):
+        family = getattr(self, "_icon_family", None)
+        if not family:
+            return self._font(size, "bold")
+        key = ("icon", int(size))
+        font = self._font_cache.get(key)
+        if font is None:
+            font = ctk.CTkFont(family=family, size=int(size))
+            self._font_cache[key] = font
+        return font
+
+    def _detect_icon_font(self):
+        try:
+            import tkinter.font as tkfont
+            families = set(tkfont.families(self))
+        except Exception:
+            families = set()
+        self._icon_family = next((name for name in ICON_FONT_CANDIDATES if name in families), None)
+
+    def _tool_icon(self, key):
+        for item_key, glyph, fallback, _name, _desc in TOOL_ITEMS:
+            if item_key == key:
+                return glyph if self._icon_family else fallback
+        return ""
+
+    def _btn(self, parent, text, command, kind="secondary", size="sm", width=None, **extra):
+        """Buttons by role: primary (one per block) / secondary (outline) / text (low-frequency) / danger."""
+        styles = {
+            "primary": dict(fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, text_color="#FFFFFF", border_width=0),
+            "secondary": dict(fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, text_color=COLOR_TEXT, border_width=1, border_color=COLOR_BORDER),
+            "text": dict(fg_color="transparent", hover_color=COLOR_HOVER, text_color=COLOR_MUTED, border_width=0),
+            "danger": dict(fg_color=COLOR_DANGER, hover_color=COLOR_DANGER_HOVER, text_color="#FFFFFF", border_width=0),
+        }
+        options = dict(styles[kind])
+        options.update(extra)
+        if width is not None:
+            options["width"] = width
+        return ctk.CTkButton(
+            parent, text=text, command=command, height=BUTTON_HEIGHT[size], corner_radius=RADIUS_CONTROL,
+            font=self._t("label"), **options,
+        )
 
     def _font(self, size, weight="normal"):
         """Reuse CTkFont objects instead of creating one for every widget."""
@@ -1947,6 +2128,8 @@ class XiaoXinAssistant(ctk.CTk):
 
         Return True only when the caller needs to build the page widgets.
         """
+        # 不要改成“所有页面叠放、切换时 lift()”：实测缓存页切换只快约 0.2 秒，
+        # 但隐藏页面仍参与布局，调整窗口大小会从约 2 秒变成约 8 秒。
         current = getattr(self, "content", None)
         try:
             if current is not None and current.winfo_exists():
@@ -2034,7 +2217,7 @@ class XiaoXinAssistant(ctk.CTk):
 
         title_box = ctk.CTkFrame(brand, fg_color="transparent")
         title_box.pack(side="left", fill="x", expand=True)
-        ctk.CTkLabel(title_box, text=APP_NAME, text_color=COLOR_TEXT, font=self._font(23, "bold")).pack(anchor="w")
+        ctk.CTkLabel(title_box, text=APP_NAME, text_color=COLOR_TEXT, font=self._t("page_title")).pack(anchor="w")
         ctk.CTkLabel(title_box, text=APP_SUBTITLE, text_color=COLOR_MUTED, font=self._font(13)).pack(anchor="w", pady=(3, 0))
 
         self.nav_container = ctk.CTkFrame(self.sidebar, fg_color=COLOR_SIDEBAR, corner_radius=0)
@@ -2042,21 +2225,9 @@ class XiaoXinAssistant(ctk.CTk):
         self.nav_container.grid_columnconfigure(0, weight=1)
 
         self.nav_buttons = {}
-        # v2.4.15: 高频测试工具靠前，专项工具靠后；图标列和文本列使用固定布局保证左对齐。
-        for key, icon, text in [
-            ("home", "▦", "工具箱"),
-            ("adb_tools", "▣", "ADB 工具"),
-            ("adb_log", "▤", "日志抓取"),
-            ("log_analysis", "◇", "日志分析"),
-            ("ios_log", "◇", "iOS 日志"),
-            ("compare", "≋", "文件比对"),
-            ("config_validator", "表", "配置表校验"),
-            ("time_tools", "时", "时间测试"),
-            ("localization", "文", "多语言检查"),
-            ("network", "◎", "网络弱网"),
-            ("clicker", "⌁", "鼠标连点"),
-        ]:
-            self._nav_button(key, icon, text)
+        # 高频测试工具靠前，专项工具靠后；导航和首页共用 TOOL_ITEMS 的图标和名称。
+        for key, _glyph, _fallback, text, _desc in TOOL_ITEMS:
+            self._nav_button(key, self._tool_icon(key), text)
 
         bottom = ctk.CTkFrame(self.sidebar, fg_color=COLOR_SURFACE_2, corner_radius=14, border_width=1, border_color=COLOR_BORDER)
         bottom.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 22))
@@ -2071,19 +2242,7 @@ class XiaoXinAssistant(ctk.CTk):
 
         ctk.CTkLabel(bottom, text=f"版本 {APP_VERSION}", text_color=COLOR_MUTED, font=self._font(12), anchor="w").grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 10))
 
-        ctk.CTkButton(
-            bottom,
-            text="管理员重启",
-            height=38,
-            corner_radius=12,
-            fg_color=COLOR_SELECTED,
-            hover_color=COLOR_HOVER,
-            border_width=1,
-            border_color=COLOR_BORDER,
-            text_color=COLOR_TEXT,
-            font=self._font(13, "bold"),
-            command=relaunch_as_admin
-        ).grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 14))
+        self._btn(bottom, "管理员重启", relaunch_as_admin, kind="secondary").grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 14))
 
     def _nav_button(self, key, icon, text):
         parent = getattr(self, "nav_container", self.sidebar)
@@ -2099,7 +2258,7 @@ class XiaoXinAssistant(ctk.CTk):
             width=24,
             anchor="center",
             text_color=COLOR_MUTED,
-            font=self._font(14, "bold"),
+            font=self._icon_font(15),
         )
         icon_label.grid(row=0, column=0, sticky="nsw", padx=(12, 8), pady=0)
         text_label = ctk.CTkLabel(
@@ -2107,7 +2266,7 @@ class XiaoXinAssistant(ctk.CTk):
             text=text,
             anchor="w",
             text_color=COLOR_MUTED,
-            font=self._font(15, "bold"),
+            font=self._font(14, "bold"),
         )
         text_label.grid(row=0, column=1, sticky="nsew", padx=(0, 10), pady=0)
 
@@ -2132,7 +2291,7 @@ class XiaoXinAssistant(ctk.CTk):
         try:
             if isinstance(widgets, dict):
                 widgets["frame"].configure(fg_color=COLOR_SELECTED if selected else "transparent")
-                widgets["icon"].configure(text_color=COLOR_TEXT if selected else COLOR_MUTED)
+                widgets["icon"].configure(text_color=COLOR_ACCENT if selected else COLOR_MUTED)
                 widgets["label"].configure(text_color=COLOR_TEXT if selected else COLOR_MUTED)
             else:
                 widgets.configure(fg_color=COLOR_SELECTED if selected else "transparent", text_color=COLOR_TEXT if selected else COLOR_MUTED)
@@ -2181,52 +2340,36 @@ class XiaoXinAssistant(ctk.CTk):
         wrap.pack(fill="both", expand=True, padx=18, pady=16)
         wrap.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(wrap, text="设置", text_color=COLOR_TEXT, font=self._font(18, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 10))
+        ctk.CTkLabel(wrap, text="设置", text_color=COLOR_TEXT, font=self._t("card_title")).grid(row=0, column=0, sticky="w", pady=(0, 10))
 
-        self._panel_section_title(wrap, 1, "外观设置")
+        # 外观与窗口：开关放在同一行右侧，不再重复写“深色模式”。
+        self._panel_section_title(wrap, 1, "外观与窗口")
         theme_card = self._panel_card(wrap, 2)
-        ctk.CTkLabel(theme_card, text="深色模式", text_color=COLOR_TEXT, font=self._font(14, "bold")).pack(anchor="w", padx=14, pady=(10, 2))
-        ctk.CTkLabel(theme_card, text="启动后默认使用深色界面", text_color=COLOR_MUTED, font=self._font(12)).pack(anchor="w", padx=14, pady=(0, 6))
-        self.theme_switch = ctk.CTkSwitch(theme_card, text="深色模式", variable=self.theme_mode_var, onvalue="深色模式", offvalue="浅色模式", command=self._on_theme_toggle, button_color=COLOR_ACCENT, progress_color=COLOR_ACCENT, text_color=COLOR_TEXT, font=self._font(13))
+        theme_row = ctk.CTkFrame(theme_card, fg_color="transparent")
+        theme_row.pack(fill="x", padx=14, pady=(10, 2))
+        ctk.CTkLabel(theme_row, text="深色模式", text_color=COLOR_TEXT, font=self._t("label")).pack(side="left")
+        self.theme_switch = ctk.CTkSwitch(theme_row, text="", width=46, variable=self.theme_mode_var, onvalue="深色模式", offvalue="浅色模式", command=self._on_theme_toggle, button_color=COLOR_ACCENT, progress_color=COLOR_ACCENT)
         self.theme_switch.select()
-        self.theme_switch.pack(anchor="w", padx=14, pady=(0, 10))
+        self.theme_switch.pack(side="right")
+        tray_tip = "关闭窗口隐藏到托盘，最小化留在任务栏" if self.tray_available else "托盘依赖未安装，运行 run.bat 安装后可用"
+        ctk.CTkLabel(theme_card, text=tray_tip, text_color=COLOR_MUTED, wraplength=230, justify="left", anchor="w", font=self._t("hint")).pack(anchor="w", fill="x", padx=14, pady=(0, 10))
 
-        tray_card = self._panel_card(wrap, 3)
-        ctk.CTkLabel(tray_card, text="系统托盘", text_color=COLOR_TEXT, font=self._font(14, "bold")).pack(anchor="w", padx=14, pady=(10, 2))
-        tray_tip = "关闭可隐藏到托盘\n最小化保留任务栏"
-        if not self.tray_available:
-            tray_tip = "托盘依赖未安装\n运行 run.bat 安装"
-        ctk.CTkLabel(
-            tray_card,
-            text=tray_tip,
-            text_color=COLOR_MUTED,
-            wraplength=170,
-            justify="left",
-            anchor="w",
-            font=self._font(12),
-        ).pack(anchor="w", fill="x", padx=14, pady=(0, 10))
-
-        self._panel_section_title(wrap, 4, "快捷信息")
-        hotkey_card = self._panel_card(wrap, 5)
+        # 运行状态：只保留会变化的信息；管理员状态在左下角，不再重复。
+        self._panel_section_title(wrap, 3, "运行状态")
+        hotkey_card = self._panel_card(wrap, 4)
         self._mini_info_row(hotkey_card, "连点热键", self.hotkey_var)
-        self._mini_info_row(hotkey_card, "日志状态", self.adb_status_var)
-        self._mini_info_row(hotkey_card, "录屏状态", self.adb_recording_status_var)
-        self._mini_info_static(hotkey_card, "文件比对", "本地模式")
-        self._mini_info_static(hotkey_card, "多语言检查", "本地模式")
-        self._mini_info_static(hotkey_card, "配置表校验", "本地模式")
-        self._panel_section_title(wrap, 6, "系统状态")
-        state_card = self._panel_card(wrap, 7)
-        self._mini_info_static(state_card, "管理员", "已开启" if is_admin() else "未开启")
-        self._mini_info_static(state_card, "本地模式", "已启用")
+        self._mini_info_row(hotkey_card, "日志抓取", self.adb_status_var)
+        self._mini_info_row(hotkey_card, "ADB 录屏", self.adb_recording_status_var)
 
-        update_card = self._panel_card(wrap, 8)
+        self._panel_section_title(wrap, 5, "在线更新")
+        update_card = self._panel_card(wrap, 6)
         update_row = ctk.CTkFrame(update_card, fg_color="transparent")
         update_row.pack(fill="x", padx=12, pady=10)
         update_text = ctk.CTkFrame(update_row, fg_color="transparent")
         update_text.pack(side="left", fill="x", expand=True, padx=(2, 8))
         ctk.CTkLabel(
             update_text,
-            text=f"在线更新  v{APP_VERSION}",
+            text=f"当前版本  v{APP_VERSION}",
             text_color=COLOR_TEXT,
             anchor="w",
             font=self._font(12, "bold"),
@@ -2480,8 +2623,6 @@ class XiaoXinAssistant(ctk.CTk):
         self.update_idletasks()
         self._configure_ttk_styles()
         self._refresh_ttk_theme_widgets()
-        if hasattr(self, "theme_switch"):
-            self.theme_switch.configure(text=self.theme_mode_var.get())
         self.configure(fg_color=COLOR_BG)
         self.show_page(self.current_page)
 
@@ -2496,8 +2637,11 @@ class XiaoXinAssistant(ctk.CTk):
 
         self.current_page = key
 
-        for page, btn in self.nav_buttons.items():
-            self._set_nav_button_state(btn, page == key)
+        # 只更新离开和进入的两个导航项；全部重设会让 11 项一起重画。
+        for page in {previous_page, key}:
+            btn = self.nav_buttons.get(page)
+            if btn is not None:
+                self._set_nav_button_state(btn, page == key)
 
         needs_build = self._recreate_content_container(key)
 
@@ -2526,6 +2670,9 @@ class XiaoXinAssistant(ctk.CTk):
             self._set_badge(self.adb_log.running.is_set())
             if needs_build:
                 self._build_adb_log_page()
+                self.after(300, self._auto_detect_adb_devices_once)
+            else:
+                self._flush_adb_live_preview()
         elif key == "log_analysis":
             self.page_title.configure(text="日志分析")
             self.page_subtitle.configure(text="关键字监控、崩溃日志提取和异常报告导出")
@@ -2541,6 +2688,7 @@ class XiaoXinAssistant(ctk.CTk):
             self._set_badge(self.adb_tools.is_recording())
             if needs_build:
                 self._build_adb_tools_page()
+                self.after(300, self._auto_detect_adb_devices_once)
         elif key == "ios_log":
             self.page_title.configure(text="iOS 日志")
             self.page_subtitle.configure(text="Windows 下通过 libimobiledevice 抓取 iPhone / iPad 实时日志")
@@ -2693,6 +2841,7 @@ class XiaoXinAssistant(ctk.CTk):
         if item is None:
             if page == "home":
                 self._set_badge(False)
+                self._refresh_home_running()
             return
         task_name, refresh, admin_required = item
         self._set_task_badge(self._task_snapshot(task_name), admin_required=admin_required)
@@ -2702,7 +2851,7 @@ class XiaoXinAssistant(ctk.CTk):
             pass
 
     def _card(self, parent):
-        card = ctk.CTkFrame(parent, fg_color=COLOR_SURFACE, corner_radius=16, border_width=1, border_color=COLOR_BORDER)
+        card = ctk.CTkFrame(parent, fg_color=COLOR_SURFACE, corner_radius=RADIUS_CARD, border_width=1, border_color=COLOR_BORDER)
         card.pack(fill="x", pady=(0, 16))
         card.grid_columnconfigure(1, weight=1)
         return card
@@ -2711,12 +2860,12 @@ class XiaoXinAssistant(ctk.CTk):
         ctk.CTkFrame(parent, height=1, fg_color=COLOR_BORDER).grid(row=row, column=0, columnspan=3, sticky="ew", padx=24)
 
     def _entry_row(self, parent, row, label, variable, placeholder="", width=420):
-        ctk.CTkLabel(parent, text=label, text_color=COLOR_TEXT, font=self._font(15, "bold")).grid(row=row, column=0, sticky="w", padx=(24, 22), pady=18)
-        ctk.CTkEntry(parent, textvariable=variable, width=width, height=42, corner_radius=10, fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER, text_color=COLOR_TEXT, placeholder_text=placeholder, font=self._font(14)).grid(row=row, column=1, sticky="w", pady=18)
+        ctk.CTkLabel(parent, text=label, text_color=COLOR_TEXT, font=self._t("label")).grid(row=row, column=0, sticky="w", padx=(SPACE_CARD, 22), pady=18)
+        ctk.CTkEntry(parent, textvariable=variable, width=width, height=42, corner_radius=10, fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER, text_color=COLOR_TEXT, placeholder_text=placeholder, font=self._t("body")).grid(row=row, column=1, sticky="w", pady=18)
 
     def _option_row(self, parent, row, label, variable, values, width=420, command=None):
-        ctk.CTkLabel(parent, text=label, text_color=COLOR_TEXT, font=self._font(15, "bold")).grid(row=row, column=0, sticky="w", padx=(24, 22), pady=18)
-        ctk.CTkOptionMenu(parent, variable=variable, values=values, width=width, height=42, corner_radius=10, fg_color=COLOR_SURFACE_2, button_color=COLOR_SURFACE_2, button_hover_color=COLOR_HOVER, dropdown_fg_color=COLOR_SURFACE, dropdown_hover_color=COLOR_HOVER, dropdown_text_color=COLOR_TEXT, text_color=COLOR_TEXT, font=self._font(14), dropdown_font=self._font(14), command=command).grid(row=row, column=1, sticky="w", pady=18)
+        ctk.CTkLabel(parent, text=label, text_color=COLOR_TEXT, font=self._t("label")).grid(row=row, column=0, sticky="w", padx=(SPACE_CARD, 22), pady=18)
+        ctk.CTkOptionMenu(parent, variable=variable, values=values, width=width, height=42, corner_radius=10, fg_color=COLOR_SURFACE_2, button_color=COLOR_SURFACE_2, button_hover_color=COLOR_HOVER, dropdown_fg_color=COLOR_SURFACE, dropdown_hover_color=COLOR_HOVER, dropdown_text_color=COLOR_TEXT, text_color=COLOR_TEXT, font=self._t("body"), dropdown_font=self._t("body"), command=command).grid(row=row, column=1, sticky="w", pady=18)
 
 
     # ---------- Time test tool page ----------
@@ -2737,16 +2886,64 @@ class XiaoXinAssistant(ctk.CTk):
         box = ctk.CTkTextbox(
             parent,
             height=height,
-            corner_radius=12,
+            corner_radius=RADIUS_CONTROL,
             border_width=1,
             border_color=COLOR_BORDER,
             fg_color=COLOR_SURFACE_2,
             text_color=COLOR_TEXT,
-            font=self._font(13),
+            font=self._t("body"),
         )
         box.grid(row=row, column=0, sticky="nsew", padx=20, pady=(0, 16))
         self.time_result_boxes[key] = box
+        # 点一下某一行就复制这一行的值（“：”后面的部分），不用再整段复制后手动挑。
+        try:
+            box._textbox.configure(cursor="hand2")
+        except Exception:
+            pass
+        box.bind("<ButtonRelease-1>", lambda event, k=key: self._time_copy_line(k, event))
+        hint = ctk.CTkLabel(parent, text="点击任意一行即可复制该值", text_color=COLOR_MUTED, font=self._t("hint"))
+        hint.grid(row=max(0, row - 1), column=0, sticky="e", padx=20)
+        self.time_copy_hints[key] = hint
         return box
+
+    def _time_flash_hint(self, key, text):
+        hint = self.time_copy_hints.get(key)
+        if hint is None or not hint.winfo_exists():
+            return
+        hint.configure(text=text, text_color=COLOR_SUCCESS)
+        job = self._time_hint_jobs.pop(key, None)
+        if job:
+            try:
+                self.after_cancel(job)
+            except Exception:
+                pass
+
+        def reset():
+            self._time_hint_jobs.pop(key, None)
+            if hint.winfo_exists():
+                hint.configure(text="点击任意一行即可复制该值", text_color=COLOR_MUTED)
+
+        self._time_hint_jobs[key] = self.after(2000, reset)
+
+    def _time_copy_line(self, key, event):
+        box = self.time_result_boxes.get(key)
+        if box is None:
+            return
+        try:
+            if box._textbox.tag_ranges("sel"):
+                return  # 用户在拖选文字，不打断
+            index = box._textbox.index(f"@{event.x},{event.y}")
+            line = box._textbox.get(f"{index} linestart", f"{index} lineend").strip()
+        except Exception:
+            return
+        if not line or line.startswith("【") or line.startswith("提示") or line.startswith("说明"):
+            return
+        value = line.split("：", 1)[1].strip() if "：" in line else line
+        if not value:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(value)
+        self._time_flash_hint(key, f"已复制：{value}")
 
     def _time_set_result(self, key, text):
         box = self.time_result_boxes.get(key)
@@ -2763,28 +2960,160 @@ class XiaoXinAssistant(ctk.CTk):
             return
         text = box.get("1.0", "end").strip()
         if not text:
-            messagebox.showinfo("复制结果", "当前没有可复制的结果")
+            self._time_flash_hint(key, "当前没有可复制的结果")
             return
         self.clipboard_clear()
         self.clipboard_append(text)
-        messagebox.showinfo("复制结果", "已复制当前 Tab 结果")
+        self._time_flash_hint(key, "已复制全部结果")
+
+    # ---- 输入后自动计算 ----
+    def _bind_time_live_updates(self):
+        """Recalculate a tab's result shortly after any of its inputs changes (only for tabs already built)."""
+        if getattr(self, "_time_live_bound", False):
+            return
+        self._time_live_bound = True
+        shared = [self.time_default_tz_var, self.time_custom_offset_var]
+        groups = {
+            "ts": ([self.time_ts_input_var, self.time_ts_unit_var, self.time_ts_zone_var], "timestamp", self.time_convert_timestamp, self.time_ts_input_var),
+            "dt": ([self.time_dt_input_var, self.time_dt_tz_var, self.time_custom_offset_var], "timestamp", self.time_convert_datetime, self.time_dt_input_var),
+            "unit": ([self.time_unit_value_var, self.time_unit_from_var], "unit", self.time_convert_unit_values, self.time_unit_value_var),
+            "diff": ([self.time_diff_start_var, self.time_diff_end_var] + shared, "diff", self.time_calculate_difference, self.time_diff_end_var),
+            "add": ([self.time_add_base_var, self.time_add_direction_var, self.time_add_days_var, self.time_add_hours_var,
+                     self.time_add_minutes_var, self.time_add_seconds_var] + shared, "add", self.time_add_or_subtract, self.time_add_base_var),
+            "countdown": ([self.time_countdown_now_var, self.time_countdown_end_var] + shared, "countdown", self.time_check_countdown, self.time_countdown_end_var),
+            "boundary": ([self.time_boundary_base_var] + shared, "boundary", self.time_calculate_boundaries, None),
+        }
+        for group, (variables, key, compute, required) in groups.items():
+            for var in variables:
+                var.trace_add("write", lambda *_a, g=group, k=key, f=compute, r=required: self._schedule_time_live(g, k, f, r))
+
+    def _schedule_time_live(self, group, key, compute, required_var):
+        if key not in self.time_result_boxes:
+            return  # 页签还没建
+        if group in ("ts", "dt"):
+            self._time_ts_last_mode = group
+        job = self._time_live_jobs.pop(group, None)
+        if job:
+            try:
+                self.after_cancel(job)
+            except Exception:
+                pass
+
+        def run():
+            self._time_live_jobs.pop(group, None)
+            if required_var is not None and not required_var.get().strip():
+                return  # 主要输入还空着，不显示“输入错误”
+            compute()
+
+        self._time_live_jobs[group] = self.after(250, run)
+
+    # ---- 顶部当前时间 ----
+    def _build_time_clock_bar(self, parent):
+        bar = ctk.CTkFrame(parent, fg_color=COLOR_SURFACE, corner_radius=RADIUS_CARD, border_width=1, border_color=COLOR_BORDER)
+        bar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        ctk.CTkLabel(bar, text="当前时间", text_color=COLOR_MUTED, font=self._t("body")).pack(side="left", padx=(18, 8), pady=10)
+        self.time_clock_label = ctk.CTkLabel(bar, text="", text_color=COLOR_TEXT, font=self._t("label"))
+        self.time_clock_label.pack(side="left", padx=(0, 20))
+        # 点数字即复制（不再放两个按钮，最小窗口 1280 宽也放得下）；复制后数字处短暂显示“✓ 已复制”。
+        self.time_clock_seconds_label = ctk.CTkLabel(bar, text="", text_color=COLOR_ACCENT, font=self._t("body"), cursor="hand2")
+        self.time_clock_seconds_label.pack(side="left", padx=(0, 16))
+        self.time_clock_ms_label = ctk.CTkLabel(bar, text="", text_color=COLOR_ACCENT, font=self._t("body"), cursor="hand2")
+        self.time_clock_ms_label.pack(side="left")
+        self._time_clock_copied = {}
+        for label, getter in ((self.time_clock_seconds_label, lambda: str(int(time.time()))), (self.time_clock_ms_label, lambda: str(int(time.time() * 1000)))):
+            label.bind("<Button-1>", lambda _e, g=getter, l=label: self._time_copy_clock_value(g(), l))
+        self._tick_time_clock()
+
+    def _time_copy_clock_value(self, value, label):
+        self.clipboard_clear()
+        self.clipboard_append(value)
+        if not label.winfo_exists():
+            return
+        # 每秒刷新会覆盖文字，所以记下“已复制”的截止时间，刷新时先显示提示。
+        self._time_clock_copied[str(label)] = time.monotonic() + 1.5
+        label.configure(text=f"✓ 已复制 {value}", text_color=COLOR_SUCCESS)
+
+    def _tick_time_clock(self):
+        if self.is_exiting:
+            return
+        label = getattr(self, "time_clock_label", None)
+        if label is None or not label.winfo_exists():
+            return
+        # 只在时间测试页可见时刷新界面；不在本页时保持低频空转。
+        if self.current_page == "time_tools":
+            now = time.time()
+            local = datetime.fromtimestamp(now).astimezone()
+            offset = local.strftime("%z")
+            label.configure(text=f"{local.strftime('%Y-%m-%d %H:%M:%S')}（UTC{offset[:3]}:{offset[3:]}）")
+            for clock_label, text in ((self.time_clock_seconds_label, f"秒级 {int(now)}"), (self.time_clock_ms_label, f"毫秒级 {int(now * 1000)}")):
+                if time.monotonic() < self._time_clock_copied.get(str(clock_label), 0):
+                    continue  # 正在显示“已复制”
+                clock_label.configure(text=text, text_color=COLOR_ACCENT)
+            # 倒计时页“当前时间”留空时，结果跟着每秒更新。
+            if ("countdown" in self.time_result_boxes and not self.time_countdown_now_var.get().strip()
+                    and self.time_countdown_end_var.get().strip()):
+                self.time_check_countdown()
+        self.after(1000 - int((time.time() % 1) * 1000) + 5, self._tick_time_clock)
 
     def _time_card(self, parent, title, row=0, column=0):
         card = ctk.CTkFrame(parent, fg_color=COLOR_SURFACE, corner_radius=14, border_width=1, border_color=COLOR_BORDER)
         card.grid(row=row, column=column, sticky="nsew", padx=(0, 8) if column == 0 else (8, 0), pady=(0, 12))
         card.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(card, text=title, text_color=COLOR_TEXT, font=self._font(16, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", padx=18, pady=(14, 8))
+        ctk.CTkLabel(card, text=title, text_color=COLOR_TEXT, font=self._t("card_title")).grid(row=0, column=0, columnspan=3, sticky="w", padx=18, pady=(14, 8))
         return card
 
     def _time_entry(self, parent, row, label, variable, placeholder="", width=220):
-        ctk.CTkLabel(parent, text=label, text_color=COLOR_TEXT, font=self._font(13, "bold")).grid(row=row, column=0, sticky="w", padx=(18, 10), pady=7)
-        entry = ctk.CTkEntry(parent, textvariable=variable, placeholder_text=placeholder, width=width, height=34, corner_radius=10, fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13))
+        ctk.CTkLabel(parent, text=label, text_color=COLOR_TEXT, font=self._t("label")).grid(row=row, column=0, sticky="w", padx=(18, 10), pady=7)
+        entry = ctk.CTkEntry(parent, textvariable=variable, placeholder_text=placeholder, width=width, height=34, corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("body"))
         entry.grid(row=row, column=1, sticky="ew", padx=(0, 18), pady=7)
         return entry
 
     def _time_menu(self, parent, row, label, variable, values, width=220):
-        ctk.CTkLabel(parent, text=label, text_color=COLOR_TEXT, font=self._font(13, "bold")).grid(row=row, column=0, sticky="w", padx=(18, 10), pady=7)
-        ctk.CTkOptionMenu(parent, variable=variable, values=values, width=width, height=34, corner_radius=10, fg_color=COLOR_SURFACE_2, button_color=COLOR_SURFACE_2, button_hover_color=COLOR_HOVER, dropdown_fg_color=COLOR_SURFACE, dropdown_hover_color=COLOR_HOVER, dropdown_text_color=COLOR_TEXT, text_color=COLOR_TEXT, font=self._font(13), dropdown_font=self._font(13)).grid(row=row, column=1, sticky="ew", padx=(0, 18), pady=7)
+        ctk.CTkLabel(parent, text=label, text_color=COLOR_TEXT, font=self._t("label")).grid(row=row, column=0, sticky="w", padx=(18, 10), pady=7)
+        ctk.CTkOptionMenu(parent, variable=variable, values=values, width=width, height=34, corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, button_color=COLOR_SURFACE_2, button_hover_color=COLOR_HOVER, dropdown_fg_color=COLOR_SURFACE, dropdown_hover_color=COLOR_HOVER, dropdown_text_color=COLOR_TEXT, text_color=COLOR_TEXT, font=self._t("body"), dropdown_font=self._t("body")).grid(row=row, column=1, sticky="ew", padx=(0, 18), pady=7)
+
+    def _time_hint(self, parent, row, text, wraplength=0):
+        # 默认不折行（整行宽的表单放得下）；只有时间戳页左右两张窄卡片需要传 wraplength。
+        label = ctk.CTkLabel(parent, text=text, text_color=COLOR_MUTED, font=self._t("hint"), anchor="w", justify="left", wraplength=wraplength)
+        if wraplength:
+            # 窄卡片：占满整张卡片宽度，窗口缩小时也不会被裁掉
+            label.grid(row=row, column=0, columnspan=2, sticky="w", padx=18, pady=(0, 4))
+        else:
+            label.grid(row=row, column=1, sticky="w", padx=(0, 18), pady=(0, 4))
+
+    def _time_tz_rows(self, parent, row, tz_var, hint, label="输入时间所在时区", hint_wraplength=0):
+        """Time zone menu + one-line explanation + custom offset row (shown only for “自定义 UTC 偏移”). Returns the next free row."""
+        self._time_menu(parent, row, label, tz_var, TIMEZONE_OPTIONS)
+        self._time_hint(parent, row + 1, hint, hint_wraplength)
+        offset_label = ctk.CTkLabel(parent, text="自定义偏移", text_color=COLOR_TEXT, font=self._t("label"))
+        offset_label.grid(row=row + 2, column=0, sticky="w", padx=(18, 10), pady=7)
+        offset_entry = ctk.CTkEntry(parent, textvariable=self.time_custom_offset_var, placeholder_text="+8 / +08:00 / -05:30", width=220, height=34, corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("body"))
+        offset_entry.grid(row=row + 2, column=1, sticky="ew", padx=(0, 18), pady=7)
+
+        def sync(*_):
+            if not offset_entry.winfo_exists():
+                return
+            if tz_var.get() == "自定义 UTC 偏移":
+                offset_label.grid()
+                offset_entry.grid()
+            else:
+                offset_label.grid_remove()
+                offset_entry.grid_remove()
+
+        tz_var.trace_add("write", sync)
+        sync()
+        return row + 3
+
+    def _time_zone_phrase(self, tz_option):
+        """“美西（洛杉矶）时间” / “本地时间（UTC+08:00）” / “UTC 时间” for the one-line summaries."""
+        if tz_option == "自定义 UTC 偏移":
+            return f"UTC{self.time_custom_offset_var.get().strip() or '+0'} 时间"
+        if tz_option in ("", "本地时区"):
+            offset = datetime.now().astimezone().strftime("%z")
+            return f"本地时间（UTC{offset[:3]}:{offset[3:]}）"
+        if tz_option == "UTC":
+            return "UTC 时间"
+        return f"{tz_option}时间"
 
     def _time_action_row(self, parent, row, buttons):
         action = ctk.CTkFrame(parent, fg_color="transparent")
@@ -2793,17 +3122,17 @@ class XiaoXinAssistant(ctk.CTk):
             ctk.CTkButton(
                 action,
                 text=text,
-                width=110,
-                height=32,
-                corner_radius=10,
+                width=10,  # 按文字宽度（窄卡片里放得下 3 个按钮）
+                height=BUTTON_HEIGHT["sm"],
+                corner_radius=RADIUS_CONTROL,
                 fg_color=COLOR_ACCENT if primary else COLOR_SURFACE_2,
                 hover_color=COLOR_ACCENT_HOVER if primary else COLOR_HOVER,
                 border_width=0 if primary else 1,
                 border_color=COLOR_BORDER,
                 text_color="#FFFFFF" if primary else COLOR_TEXT,
-                font=self._font(13, "bold"),
+                font=self._t("label"),
                 command=command,
-            ).pack(side="left", padx=(0, 10))
+            ).pack(side="left", padx=(0, SPACE_INLINE))
 
     def _build_time_tools_page(self):
         for child in self.content.winfo_children():
@@ -2812,20 +3141,42 @@ class XiaoXinAssistant(ctk.CTk):
             except Exception:
                 pass
         self.content.grid_columnconfigure(0, weight=1)
-        self.content.grid_rowconfigure(0, weight=1)
+        self.content.grid_rowconfigure(0, weight=0)
+        self.content.grid_rowconfigure(1, weight=1)
         self.time_result_boxes = {}
+        self.time_copy_hints = {}
+        self._build_time_clock_bar(self.content)
+        self._bind_time_live_updates()
 
-        tabview = ctk.CTkTabview(self.content, fg_color=COLOR_SURFACE, segmented_button_fg_color=COLOR_SURFACE_2, segmented_button_selected_color=COLOR_ACCENT, segmented_button_selected_hover_color=COLOR_ACCENT_HOVER, segmented_button_unselected_color=COLOR_SURFACE_2, segmented_button_unselected_hover_color=COLOR_HOVER, text_color=COLOR_TEXT, corner_radius=16, border_width=1, border_color=COLOR_BORDER)
-        tabview.grid(row=0, column=0, sticky="nsew")
+        tabview = ctk.CTkTabview(self.content, fg_color=COLOR_SURFACE, segmented_button_fg_color=COLOR_SURFACE_2, segmented_button_selected_color=COLOR_ACCENT, segmented_button_selected_hover_color=COLOR_ACCENT_HOVER, segmented_button_unselected_color=COLOR_SURFACE_2, segmented_button_unselected_hover_color=COLOR_HOVER, text_color=COLOR_TEXT, corner_radius=RADIUS_CARD, border_width=1, border_color=COLOR_BORDER)
+        tabview.grid(row=1, column=0, sticky="nsew")
         for name in ["时间戳转换", "单位换算", "时间差计算", "时间加减", "倒计时校验", "边界时间"]:
             tabview.add(name)
 
-        self._build_timestamp_tab(tabview.tab("时间戳转换"))
-        self._build_unit_tab(tabview.tab("单位换算"))
-        self._build_diff_tab(tabview.tab("时间差计算"))
-        self._build_add_tab(tabview.tab("时间加减"))
-        self._build_countdown_tab(tabview.tab("倒计时校验"))
-        self._build_boundary_tab(tabview.tab("边界时间"))
+        # 只建当前页签，其余点到时再建：6 个页签一次建好要 2 秒左右。
+        self._make_lazy_tabview(tabview, {
+            "时间戳转换": self._build_timestamp_tab,
+            "单位换算": self._build_unit_tab,
+            "时间差计算": self._build_diff_tab,
+            "时间加减": self._build_add_tab,
+            "倒计时校验": self._build_countdown_tab,
+            "边界时间": self._build_boundary_tab,
+        })
+
+    def _make_lazy_tabview(self, tabview, builders):
+        """Build each tab's widgets the first time it is shown; return ensure(name) for programmatic switches."""
+        built = set()
+
+        def ensure(name=None):
+            name = name or tabview.get()
+            if name in built or name not in builders:
+                return
+            built.add(name)
+            builders[name](tabview.tab(name))
+
+        tabview.configure(command=ensure)
+        ensure()
+        return ensure
 
     def _build_timestamp_tab(self, tab):
         tab.grid_columnconfigure(0, weight=1)
@@ -2837,19 +3188,20 @@ class XiaoXinAssistant(ctk.CTk):
         left = self._time_card(form, "时间戳转日期时间", 0, 0)
         self._time_entry(left, 1, "时间戳", self.time_ts_input_var, "10 位秒级或 13 位毫秒级")
         self._time_menu(left, 2, "单位", self.time_ts_unit_var, ["自动识别", "秒", "毫秒"])
-        self._time_action_row(left, 3, [("转换", self.time_convert_timestamp, True), ("复制结果", lambda: self._time_copy_result("timestamp"), False)])
+        self._time_menu(left, 3, "同时显示", self.time_ts_zone_var, TIMEZONE_DISPLAY_OPTIONS)
+        self._time_hint(left, 4, "本地和UTC时间总会显示，可再加一个", wraplength=250)
+        self._time_action_row(left, 5, [("转换", self.time_convert_timestamp, True), ("复制结果", lambda: self._time_copy_result("timestamp"), False)])
 
         right = self._time_card(form, "日期时间转时间戳", 0, 1)
         self._time_entry(right, 1, "日期时间", self.time_dt_input_var, "2026-06-09 15:30:00")
-        self._time_menu(right, 2, "时区", self.time_dt_tz_var, ["本地时区", "UTC", "UTC+8", "自定义 UTC 偏移"])
-        self._time_entry(right, 3, "自定义偏移", self.time_custom_offset_var, "+8 / +08:00 / -05:30")
-        self._time_action_row(right, 4, [("转换", self.time_convert_datetime, True), ("填入当前时间", lambda: self.time_dt_input_var.set(self._time_now_string()), False), ("复制结果", lambda: self._time_copy_result("timestamp"), False)])
+        next_row = self._time_tz_rows(right, 2, self.time_dt_tz_var, "上面填的日期时间是哪个时区的时间", hint_wraplength=250)
+        self._time_action_row(right, next_row, [("转换", self.time_convert_datetime, True), ("填入当前时间", lambda: self.time_dt_input_var.set(self._time_now_string()), False), ("复制结果", lambda: self._time_copy_result("timestamp"), False)])
 
         result_card = ctk.CTkFrame(tab, fg_color=COLOR_SURFACE, corner_radius=14, border_width=1, border_color=COLOR_BORDER)
         result_card.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
         result_card.grid_columnconfigure(0, weight=1)
         result_card.grid_rowconfigure(1, weight=1)
-        ctk.CTkLabel(result_card, text="转换结果", text_color=COLOR_TEXT, font=self._font(16, "bold")).grid(row=0, column=0, sticky="w", padx=20, pady=(14, 8))
+        ctk.CTkLabel(result_card, text="转换结果", text_color=COLOR_TEXT, font=self._t("card_title")).grid(row=0, column=0, sticky="w", padx=20, pady=(14, 8))
         self._time_textbox(result_card, 1, "timestamp", height=250)
         self._time_set_result("timestamp", "提示：可输入 10 位秒级或 13 位毫秒级时间戳，也可输入日期时间转为秒级 / 毫秒级时间戳。")
 
@@ -2866,7 +3218,7 @@ class XiaoXinAssistant(ctk.CTk):
         result.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
         result.grid_columnconfigure(0, weight=1)
         result.grid_rowconfigure(1, weight=1)
-        ctk.CTkLabel(result, text="换算结果", text_color=COLOR_TEXT, font=self._font(16, "bold")).grid(row=0, column=0, sticky="w", padx=20, pady=(14, 8))
+        ctk.CTkLabel(result, text="换算结果", text_color=COLOR_TEXT, font=self._t("card_title")).grid(row=0, column=0, sticky="w", padx=20, pady=(14, 8))
         self._time_textbox(result, 1, "unit", height=330)
         self.time_convert_unit_values()
 
@@ -2878,14 +3230,13 @@ class XiaoXinAssistant(ctk.CTk):
         form.grid_columnconfigure(1, weight=1)
         self._time_entry(form, 0, "开始时间", self.time_diff_start_var, "2026-06-09 15:30:00")
         self._time_entry(form, 1, "结束时间", self.time_diff_end_var, "2026-06-12 19:42:05")
-        self._time_menu(form, 2, "时区", self.time_default_tz_var, ["本地时区", "UTC", "UTC+8", "自定义 UTC 偏移"])
-        self._time_entry(form, 3, "自定义偏移", self.time_custom_offset_var, "+8 / +08:00 / -05:30")
-        self._time_action_row(form, 4, [("计算差值", self.time_calculate_difference, True), ("开始=当前", lambda: self.time_diff_start_var.set(self._time_now_string()), False), ("结束=当前", lambda: self.time_diff_end_var.set(self._time_now_string()), False), ("复制结果", lambda: self._time_copy_result("diff"), False)])
+        next_row = self._time_tz_rows(form, 2, self.time_default_tz_var, "开始时间和结束时间都按这个时区理解")
+        self._time_action_row(form, next_row, [("计算差值", self.time_calculate_difference, True), ("开始=当前", lambda: self.time_diff_start_var.set(self._time_now_string()), False), ("结束=当前", lambda: self.time_diff_end_var.set(self._time_now_string()), False), ("复制结果", lambda: self._time_copy_result("diff"), False)])
         result = ctk.CTkFrame(tab, fg_color=COLOR_SURFACE, corner_radius=14, border_width=1, border_color=COLOR_BORDER)
         result.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
         result.grid_columnconfigure(0, weight=1)
         result.grid_rowconfigure(1, weight=1)
-        ctk.CTkLabel(result, text="时间差结果", text_color=COLOR_TEXT, font=self._font(16, "bold")).grid(row=0, column=0, sticky="w", padx=20, pady=(14, 8))
+        ctk.CTkLabel(result, text="时间差结果", text_color=COLOR_TEXT, font=self._t("card_title")).grid(row=0, column=0, sticky="w", padx=20, pady=(14, 8))
         self._time_textbox(result, 1, "diff", height=300)
         self._time_set_result("diff", "提示：用于活动持续时间、礼包倒计时、任务刷新间隔、日志时间差排查。")
 
@@ -2898,7 +3249,7 @@ class XiaoXinAssistant(ctk.CTk):
         self._time_entry(form, 0, "基准时间", self.time_add_base_var, "2026-06-09 15:30:00")
         self._time_menu(form, 1, "方向", self.time_add_direction_var, ["增加", "减少"])
 
-        ctk.CTkLabel(form, text="时长", text_color=COLOR_TEXT, font=self._font(13, "bold")).grid(row=2, column=0, sticky="w", padx=(18, 10), pady=7)
+        ctk.CTkLabel(form, text="时长", text_color=COLOR_TEXT, font=self._t("label")).grid(row=2, column=0, sticky="w", padx=(18, 10), pady=7)
         duration_frame = ctk.CTkFrame(form, fg_color="transparent")
         duration_frame.grid(row=2, column=1, sticky="ew", padx=(0, 18), pady=7)
         for idx in range(8):
@@ -2909,19 +3260,20 @@ class XiaoXinAssistant(ctk.CTk):
         self._time_duration_entry(duration_frame, 4, self.time_add_minutes_var, "0", "分")
         self._time_duration_entry(duration_frame, 6, self.time_add_seconds_var, "0", "秒")
 
-        self._time_action_row(form, 3, [("计算", self.time_add_or_subtract, True), ("基准=当前", lambda: self.time_add_base_var.set(self._time_now_string()), False), ("复制结果", lambda: self._time_copy_result("add"), False)])
+        next_row = self._time_tz_rows(form, 3, self.time_default_tz_var, "基准时间按这个时区理解，结果也按这个时区显示")
+        self._time_action_row(form, next_row, [("计算", self.time_add_or_subtract, True), ("基准=当前", lambda: self.time_add_base_var.set(self._time_now_string()), False), ("复制结果", lambda: self._time_copy_result("add"), False)])
         result = ctk.CTkFrame(tab, fg_color=COLOR_SURFACE, corner_radius=14, border_width=1, border_color=COLOR_BORDER)
         result.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
         result.grid_columnconfigure(0, weight=1)
         result.grid_rowconfigure(1, weight=1)
-        ctk.CTkLabel(result, text="时间加减结果", text_color=COLOR_TEXT, font=self._font(16, "bold")).grid(row=0, column=0, sticky="w", padx=20, pady=(14, 8))
+        ctk.CTkLabel(result, text="时间加减结果", text_color=COLOR_TEXT, font=self._t("card_title")).grid(row=0, column=0, sticky="w", padx=20, pady=(14, 8))
         self._time_textbox(result, 1, "add", height=300)
         self._time_set_result("add", "提示：用于当前时间 + 7 天活动结束、当前时间 - 1 天跨天验证、服务器时间推进后状态预期计算；直接填写天 / 时 / 分 / 秒。")
 
     def _time_duration_entry(self, parent, column, variable, placeholder, unit_text):
-        entry = ctk.CTkEntry(parent, textvariable=variable, placeholder_text=placeholder, width=96, height=34, corner_radius=10, fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13), justify="center")
+        entry = ctk.CTkEntry(parent, textvariable=variable, placeholder_text=placeholder, width=96, height=34, corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("body"), justify="center")
         entry.grid(row=0, column=column, sticky="w", padx=(0, 6), pady=0)
-        ctk.CTkLabel(parent, text=unit_text, text_color=COLOR_MUTED, font=self._font(13, "bold")).grid(row=0, column=column + 1, sticky="w", padx=(0, 14), pady=0)
+        ctk.CTkLabel(parent, text=unit_text, text_color=COLOR_MUTED, font=self._t("label")).grid(row=0, column=column + 1, sticky="w", padx=(0, 14), pady=0)
         return entry
 
     def _build_countdown_tab(self, tab):
@@ -2932,14 +3284,13 @@ class XiaoXinAssistant(ctk.CTk):
         form.grid_columnconfigure(1, weight=1)
         self._time_entry(form, 0, "当前时间", self.time_countdown_now_var, "留空使用本机当前时间")
         self._time_entry(form, 1, "结束时间", self.time_countdown_end_var, "2026-06-16 15:30:00")
-        self._time_menu(form, 2, "时区", self.time_default_tz_var, ["本地时区", "UTC", "UTC+8", "自定义 UTC 偏移"])
-        self._time_entry(form, 3, "自定义偏移", self.time_custom_offset_var, "+8 / +08:00 / -05:30")
-        self._time_action_row(form, 4, [("校验倒计时", self.time_check_countdown, True), ("当前=本机", lambda: self.time_countdown_now_var.set(self._time_now_string()), False), ("复制结果", lambda: self._time_copy_result("countdown"), False)])
+        next_row = self._time_tz_rows(form, 2, self.time_default_tz_var, "当前时间和结束时间都按这个时区理解；当前时间留空则用本机此刻")
+        self._time_action_row(form, next_row, [("校验倒计时", self.time_check_countdown, True), ("当前=本机", lambda: self.time_countdown_now_var.set(self._time_now_string()), False), ("复制结果", lambda: self._time_copy_result("countdown"), False)])
         result = ctk.CTkFrame(tab, fg_color=COLOR_SURFACE, corner_radius=14, border_width=1, border_color=COLOR_BORDER)
         result.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
         result.grid_columnconfigure(0, weight=1)
         result.grid_rowconfigure(1, weight=1)
-        ctk.CTkLabel(result, text="倒计时结果", text_color=COLOR_TEXT, font=self._font(16, "bold")).grid(row=0, column=0, sticky="w", padx=20, pady=(14, 8))
+        ctk.CTkLabel(result, text="倒计时结果", text_color=COLOR_TEXT, font=self._t("card_title")).grid(row=0, column=0, sticky="w", padx=20, pady=(14, 8))
         self._time_textbox(result, 1, "countdown", height=300)
         self._time_set_result("countdown", "提示：当前时间留空时使用本机当前时间，只读取时间，不会修改系统时间。")
 
@@ -2950,30 +3301,38 @@ class XiaoXinAssistant(ctk.CTk):
         form.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 12))
         form.grid_columnconfigure(1, weight=1)
         self._time_entry(form, 0, "指定时间", self.time_boundary_base_var, "留空使用本机当前时间")
-        self._time_menu(form, 1, "时区", self.time_default_tz_var, ["本地时区", "UTC", "UTC+8", "自定义 UTC 偏移"])
-        self._time_entry(form, 2, "自定义偏移", self.time_custom_offset_var, "+8 / +08:00 / -05:30")
-        self._time_action_row(form, 3, [("计算边界", self.time_calculate_boundaries, True), ("指定=当前", lambda: self.time_boundary_base_var.set(self._time_now_string()), False), ("复制结果", lambda: self._time_copy_result("boundary"), False)])
+        next_row = self._time_tz_rows(form, 1, self.time_default_tz_var, "按这个时区的 0 点判断跨天 / 跨周 / 跨月（例如服务器按 UTC 0 点刷新就选 UTC）", label="按哪个时区计算")
+        self._time_action_row(form, next_row, [("计算边界", self.time_calculate_boundaries, True), ("指定=当前", lambda: self.time_boundary_base_var.set(self._time_now_string()), False), ("复制结果", lambda: self._time_copy_result("boundary"), False)])
         result = ctk.CTkFrame(tab, fg_color=COLOR_SURFACE, corner_radius=14, border_width=1, border_color=COLOR_BORDER)
         result.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
         result.grid_columnconfigure(0, weight=1)
         result.grid_rowconfigure(1, weight=1)
-        ctk.CTkLabel(result, text="边界时间结果", text_color=COLOR_TEXT, font=self._font(16, "bold")).grid(row=0, column=0, sticky="w", padx=20, pady=(14, 8))
+        ctk.CTkLabel(result, text="边界时间结果", text_color=COLOR_TEXT, font=self._t("card_title")).grid(row=0, column=0, sticky="w", padx=20, pady=(14, 8))
         self._time_textbox(result, 1, "boundary", height=330)
         self.time_calculate_boundaries()
 
     def time_convert_timestamp(self):
         try:
-            data = timestamp_to_datetime(self.time_ts_input_var.get(), self.time_ts_unit_var.get())
-            text = "\n".join([
+            zone = self.time_ts_zone_var.get()
+            data = timestamp_to_datetime(
+                self.time_ts_input_var.get(), self.time_ts_unit_var.get(),
+                "" if zone == "不额外显示" else zone,
+            )
+            lines = [
                 "【时间戳转日期时间】",
                 f"输入时间戳：{self.time_ts_input_var.get().strip()}",
                 f"识别单位：{data['unit']}",
                 f"本地时间：{data['local']}",
                 f"UTC 时间：{data['utc']}",
+            ]
+            if data.get("zone"):
+                lines.append(f"{data['zone_label']}：{data['zone']}")
+            lines += [
                 f"秒级时间戳：{data['seconds']}",
                 f"毫秒级时间戳：{data['milliseconds']}",
-                "说明：10 位通常为秒级，13 位通常为毫秒级。",
-            ])
+                "说明：10 位通常为秒级，13 位通常为毫秒级；“同时显示”可以再多显示一个时区的时间。",
+            ]
+            text = "\n".join(lines)
         except Exception as exc:
             text = f"输入错误：{exc}"
         self._time_set_result("timestamp", text)
@@ -2983,6 +3342,7 @@ class XiaoXinAssistant(ctk.CTk):
             data = datetime_to_timestamps(self.time_dt_input_var.get(), self.time_dt_tz_var.get(), self.time_custom_offset_var.get())
             text = "\n".join([
                 "【日期时间转时间戳】",
+                f"换算：{self._time_zone_phrase(self.time_dt_tz_var.get())} {self.time_dt_input_var.get().strip()} ＝ 本地时间 {data['local']} ＝ UTC 时间 {data['utc']}",
                 f"输入时间：{self.time_dt_input_var.get().strip()}",
                 f"使用时区：{data['timezone']}",
                 f"秒级时间戳：{data['seconds']}",
@@ -3013,6 +3373,7 @@ class XiaoXinAssistant(ctk.CTk):
             signed_seconds = int(data["seconds"])
             lines = [
                 "【时间差计算】",
+                f"说明：开始和结束都按{self._time_zone_phrase(self.time_default_tz_var.get())}理解，跨夏令时切换时按实际经过的时间计算",
                 f"开始时间：{self.time_diff_start_var.get().strip()}",
                 f"结束时间：{self.time_diff_end_var.get().strip()}",
                 f"结束时间早于开始时间：{earlier}",
@@ -3041,6 +3402,7 @@ class XiaoXinAssistant(ctk.CTk):
             )
             lines = [
                 "【时间加减计算】",
+                f"说明：基准时间和结果都是{self._time_zone_phrase(self.time_default_tz_var.get())}",
                 f"基准时间：{self.time_add_base_var.get().strip()}",
                 f"计算方式：{self.time_add_direction_var.get()} {data['duration_display']}",
                 f"计算后时间：{data['datetime']}",
@@ -3060,6 +3422,7 @@ class XiaoXinAssistant(ctk.CTk):
             if data["ended"]:
                 text = "\n".join([
                     "【倒计时校验】",
+                    f"说明：时间按{self._time_zone_phrase(self.time_default_tz_var.get())}理解；当前时间留空 = 本机此刻",
                     f"当前时间：{self.time_countdown_now_var.get().strip() or '本机当前时间'}",
                     f"结束时间：{self.time_countdown_end_var.get().strip()}",
                     "状态：已结束",
@@ -3068,6 +3431,7 @@ class XiaoXinAssistant(ctk.CTk):
             else:
                 text = "\n".join([
                     "【倒计时校验】",
+                    f"说明：时间按{self._time_zone_phrase(self.time_default_tz_var.get())}理解；当前时间留空 = 本机此刻",
                     f"当前时间：{self.time_countdown_now_var.get().strip() or '本机当前时间'}",
                     f"结束时间：{self.time_countdown_end_var.get().strip()}",
                     "状态：未结束",
@@ -3085,7 +3449,7 @@ class XiaoXinAssistant(ctk.CTk):
     def time_calculate_boundaries(self):
         try:
             data = boundary_times(self.time_boundary_base_var.get(), self.time_default_tz_var.get(), self.time_custom_offset_var.get())
-            lines = ["【跨天 / 跨周 / 跨月边界】", f"指定时间：{self.time_boundary_base_var.get().strip() or '本机当前时间'}"]
+            lines = ["【跨天 / 跨周 / 跨月边界】", f"说明：按{self._time_zone_phrase(self.time_default_tz_var.get())}的 0 点计算", f"指定时间：{self.time_boundary_base_var.get().strip() or '本机当前时间'}"]
             for label, dt in data.items():
                 seconds, milliseconds = timestamp_pair(dt)
                 lines.append("")
@@ -3115,133 +3479,105 @@ class XiaoXinAssistant(ctk.CTk):
 
         wrap = ctk.CTkFrame(self.content, fg_color=COLOR_BG, corner_radius=0)
         wrap.grid(row=0, column=0, sticky="nsew")
-        wrap.grid_columnconfigure((0, 1, 2), weight=1, uniform="home_cards")
-        wrap.grid_rowconfigure(1, weight=1)
+        wrap.grid_columnconfigure(0, weight=1)
+        wrap.grid_rowconfigure(0, weight=1)
 
-        hero = ctk.CTkFrame(wrap, fg_color=COLOR_SURFACE, corner_radius=16, border_width=1, border_color=COLOR_BORDER)
-        hero.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 12))
-        hero.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
-            hero,
-            text="工具箱",
-            text_color=COLOR_TEXT,
-            fg_color=COLOR_SURFACE,
-            font=self._font(22, "bold"),
-        ).grid(row=0, column=0, sticky="w", padx=22, pady=(16, 2))
-        ctk.CTkLabel(
-            hero,
-            text="选择需要的测试工具；高频 ADB、日志、iOS 与配置检查工具已优先展示。",
-            text_color=COLOR_MUTED,
-            fg_color=COLOR_SURFACE,
-            wraplength=620,
-            justify="left",
-            font=self._font(14),
-        ).grid(row=1, column=0, sticky="w", padx=22, pady=(0, 16))
-
+        # 工具卡片：整张卡片可点击；图标、名称、一行说明。页面标题已经写了“欢迎使用”，不再重复放大标题。
         cards = ctk.CTkFrame(wrap, fg_color=COLOR_BG, corner_radius=0)
-        cards.grid(row=1, column=0, columnspan=3, sticky="nsew")
+        cards.grid(row=0, column=0, sticky="nsew")
         cards.grid_columnconfigure((0, 1, 2), weight=1, uniform="home_cards")
-        for r in range(4):
-            cards.grid_rowconfigure(r, weight=1, uniform="home_rows")
+        cards.grid_rowconfigure((0, 1, 2, 3), weight=1, uniform="home_rows", minsize=80 + SPACE_GAP)
+        tools = [item for item in TOOL_ITEMS if item[0] != "home"]
+        for index, (key, _glyph, _fallback, name, desc) in enumerate(tools):
+            self._tool_card(cards, index // 3, index % 3, key, name, desc)
 
-        tool_items = [
-            (0, 0, "ADB 工具", "设备检测、截图录屏、应用管理", "adb_tools", "进入 ADB"),
-            (0, 1, "日志抓取", "Android ADB logcat 日志抓取", "adb_log", "进入日志"),
-            (0, 2, "日志分析", "关键字监控、崩溃提取、报告导出", "log_analysis", "进入分析"),
-            (1, 0, "iOS 日志", "Windows 下抓取 iOS 实时日志", "ios_log", "进入 iOS"),
-            (1, 1, "文件比对", "策划、配置和翻译表比对", "compare", "进入比对"),
-            (1, 2, "配置表校验", "ID、必填、数值、枚举、时间、奖励", "config_validator", "进入校验"),
-            (2, 0, "时间测试", "时间戳、倒计时、跨天周月边界", "time_tools", "进入时间"),
-            (2, 1, "多语言检查", "空翻译、中文残留、占位符、标签", "localization", "进入检查"),
-            (2, 2, "网络弱网", "指定 IP、协议、方向、延迟与丢包", "network", "进入弱网"),
-            (3, 0, "鼠标连点", "左/中/右键连点，F 键热键", "clicker", "进入连点"),
+        # 正在运行：只列出运行中的任务，点击跳到对应工具；切到首页和每 0.5 秒状态刷新时更新。
+        running = ctk.CTkFrame(wrap, fg_color=COLOR_SURFACE, corner_radius=RADIUS_CARD, border_width=1, border_color=COLOR_BORDER)
+        running.grid(row=1, column=0, sticky="ew", pady=(SPACE_GAP - 2, 0))
+        head = ctk.CTkFrame(running, fg_color="transparent")
+        head.pack(fill="x", padx=SPACE_CARD, pady=(14, 6))
+        ctk.CTkLabel(head, text="正在运行", text_color=COLOR_TEXT, font=self._t("card_title")).pack(side="left")
+        ctk.CTkLabel(head, text="点击可跳到对应工具", text_color=COLOR_MUTED, font=self._t("hint")).pack(side="right")
+        self.home_running_row = ctk.CTkFrame(running, fg_color="transparent")
+        self.home_running_row.pack(fill="x", padx=SPACE_CARD, pady=(0, 14))
+        self._home_running_view = None
+        self._refresh_home_running()
+
+    def _home_running_tasks(self):
+        return [
+            (page, name)
+            for page, name, running in (
+                ("clicker", "鼠标连点", self.clicker.running.is_set()),
+                ("network", "网络弱网", self.network.running.is_set()),
+                ("adb_log", "日志抓取", self.adb_log.running.is_set()),
+                ("adb_tools", "ADB 录屏", self.adb_tools.is_recording()),
+                ("ios_log", "iOS 日志", self.ios_log_running.is_set()),
+                ("compare", "文件比对", bool(self.compare_is_working)),
+                ("localization", "多语言检查", bool(self.loc_is_working)),
+                ("config_validator", "配置表校验", bool(self.cfg_is_working)),
+            )
+            if running
         ]
-        for item in tool_items:
-            self._tool_card(cards, *item)
 
-        recent = ctk.CTkFrame(wrap, fg_color=COLOR_SURFACE, corner_radius=16, border_width=1, border_color=COLOR_BORDER)
-        recent.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(12, 0))
-        recent.grid_columnconfigure((0, 1, 2, 3), weight=1, uniform="recent_status")
-        ctk.CTkLabel(
-            recent,
-            text="最近状态",
-            text_color=COLOR_TEXT,
-            fg_color=COLOR_SURFACE,
-            font=self._font(16, "bold"),
-        ).grid(row=0, column=0, sticky="w", padx=18, pady=(12, 4), columnspan=4)
-        recent_items = [
-            ("连点", "运行中" if self.clicker.running.is_set() else "待命"),
-            ("弱网", "运行中" if self.network.running.is_set() else "待命"),
-            ("日志", "运行中" if self.adb_log.running.is_set() else "待命"),
-            ("ADB 录屏", "运行中" if self.adb_tools.is_recording() else "待命"),
-            ("iOS 日志", "运行中" if self.ios_log_running.is_set() else "待命"),
-            ("文件比对", "运行中" if self.compare_is_working else "待命"),
-            ("多语言", "运行中" if self.loc_is_working else "待命"),
-            ("配置校验", "运行中" if self.cfg_is_working else "待命"),
-        ]
-        for idx, (label, value) in enumerate(recent_items):
-            self._home_status_chip(recent, idx + 1, label, value)
+    def _refresh_home_running(self):
+        row = getattr(self, "home_running_row", None)
+        if row is None or not row.winfo_exists():
+            return
+        tasks = self._home_running_tasks()
+        if tasks == self._home_running_view:
+            return  # 没变化不重画
+        self._home_running_view = tasks
+        for child in row.winfo_children():
+            child.destroy()
+        if not tasks:
+            ctk.CTkLabel(row, text="当前没有正在运行的任务", text_color=COLOR_MUTED, font=self._t("body")).pack(side="left")
+            return
+        for page, name in tasks:
+            chip = ctk.CTkButton(
+                row, text=f"●  {name}", height=30, corner_radius=RADIUS_TAG, fg_color=COLOR_SELECTED, hover_color=COLOR_HOVER,
+                text_color=COLOR_ACCENT, font=self._t("label"), width=10, command=lambda p=page: self.show_page(p),
+            )
+            chip.pack(side="left", padx=(0, SPACE_INLINE))
 
-    def _tool_card(self, parent, row, column, title, desc, page, button_text):
-        # v2.4.20 首页新增“时间测试”后，4 行工具卡在 1400x850 / 1280x760 下会被压缩。
-        # 按钮不再单独占用第三行，改为右侧固定按钮，避免底部被裁切。
-        card = ctk.CTkFrame(parent, fg_color=COLOR_SURFACE, corner_radius=16, border_width=1, border_color=COLOR_BORDER, height=86)
-        card.grid(row=row, column=column, sticky="nsew", padx=(0, 8) if column == 0 else (8, 8) if column == 1 else (8, 0), pady=(0, 10))
+    def _tool_card(self, parent, row, column, page, title, desc):
+        card = ctk.CTkFrame(parent, fg_color=COLOR_SURFACE, corner_radius=RADIUS_CARD, border_width=1, border_color=COLOR_BORDER, height=80)
+        card.grid(row=row, column=column, sticky="nsew", padx=(0, 6) if column == 0 else (6, 6) if column == 1 else (6, 0), pady=(0, SPACE_GAP))
         card.grid_propagate(False)
-        card.grid_columnconfigure(0, weight=1, minsize=0)
-        card.grid_columnconfigure(1, weight=0, minsize=92)
+        card.grid_columnconfigure(1, weight=1)
         card.grid_rowconfigure((0, 1), weight=1)
-        ctk.CTkLabel(
-            card,
-            text=title,
-            text_color=COLOR_TEXT,
-            fg_color=COLOR_SURFACE,
-            font=self._font(16, "bold"),
-        ).grid(row=0, column=0, sticky="sw", padx=(14, 4), pady=(8, 0))
-        ctk.CTkLabel(
-            card,
-            text=desc,
-            text_color=COLOR_MUTED,
-            fg_color=COLOR_SURFACE,
-            wraplength=122,
-            justify="left",
-            font=self._font(11),
-        ).grid(row=1, column=0, sticky="nw", padx=(14, 4), pady=(0, 8))
-        ctk.CTkButton(
-            card,
-            text=button_text,
-            width=82,
-            height=30,
-            corner_radius=10,
-            fg_color=COLOR_ACCENT,
-            hover_color=COLOR_ACCENT_HOVER,
-            text_color="#FFFFFF",
-            font=self._font(13, "bold"),
-            command=lambda page=page: self.show_page(page),
-        ).grid(row=0, column=1, rowspan=2, sticky="e", padx=(2, 10), pady=0)
+        icon = ctk.CTkLabel(card, text=self._tool_icon(page), width=40, text_color=COLOR_ACCENT, font=self._icon_font(22))
+        icon.grid(row=0, column=0, rowspan=2, sticky="w", padx=(16, 10))
+        name = ctk.CTkLabel(card, text=title, text_color=COLOR_TEXT, anchor="w", font=self._t("card_title"))
+        name.grid(row=0, column=1, sticky="sw", padx=(0, 12), pady=(10, 0))
+        info = ctk.CTkLabel(card, text=desc, text_color=COLOR_MUTED, anchor="w", font=self._t("hint"))
+        info.grid(row=1, column=1, sticky="nw", padx=(0, 12), pady=(2, 10))
 
-    def _home_status_chip(self, parent, index, label, value):
-        row = 1 + (index - 1) // 4
-        column = (index - 1) % 4
-        chip = ctk.CTkFrame(parent, fg_color=COLOR_SURFACE_2, corner_radius=10, border_width=1, border_color=COLOR_BORDER)
-        chip.grid(row=row, column=column, sticky="ew", padx=(18 if column == 0 else 6, 18 if column == 3 else 6), pady=(4, 10 if row == 2 else 4))
-        chip.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
-            chip,
-            text=label,
-            text_color=COLOR_MUTED,
-            fg_color=COLOR_SURFACE_2,
-            anchor="w",
-            font=self._font(12),
-        ).grid(row=0, column=0, sticky="w", padx=10, pady=(7, 0))
-        ctk.CTkLabel(
-            chip,
-            text=value,
-            text_color=COLOR_TEXT,
-            fg_color=COLOR_SURFACE_2,
-            anchor="w",
-            font=self._font(13, "bold"),
-        ).grid(row=1, column=0, sticky="w", padx=10, pady=(0, 7))
+        def go(_event=None):
+            self.show_page(page)
+
+        def enter(_event=None):
+            card.configure(border_color=COLOR_ACCENT, fg_color=COLOR_HOVER)
+
+        def leave(event=None):
+            # 在卡片内部的子控件之间移动也会触发 Leave，只有真的离开卡片才恢复。
+            try:
+                widget = self.winfo_containing(self.winfo_pointerx(), self.winfo_pointery())
+                while widget is not None:
+                    if widget is card:
+                        return
+                    widget = widget.master
+            except Exception:
+                pass
+            card.configure(border_color=COLOR_BORDER, fg_color=COLOR_SURFACE)
+
+        for widget in (card, icon, name, info):
+            widget.bind("<Button-1>", go)
+            widget.bind("<Enter>", enter)
+            widget.bind("<Leave>", leave)
+            try:
+                widget.configure(cursor="hand2")
+            except Exception:
+                pass
 
     # ---------- Clicker page ----------
     def _build_clicker_page(self):
@@ -3255,37 +3591,149 @@ class XiaoXinAssistant(ctk.CTk):
         self._option_row(card, 2, "点击间隔", self.click_interval_var, ["自定义", "高效模式（每秒10次）", "极速模式（每秒100次）"], command=self._on_click_interval_changed)
         self._divider(card, 3)
         self._option_row(card, 4, "启动/停止热键", self.hotkey_var, ["F6", "F7", "F8", "F9", "F10", "F11", "F12"], command=lambda _: self._refresh_click_tip())
+        self._divider(card, 5)
+        # 自动停止：两项都填 0 表示不限，任意一项先达到就停。
+        ctk.CTkLabel(card, text="自动停止", text_color=COLOR_TEXT, font=self._t("label")).grid(row=6, column=0, sticky="w", padx=(SPACE_CARD, 22), pady=18)
+        limits = ctk.CTkFrame(card, fg_color="transparent")
+        limits.grid(row=6, column=1, sticky="w", pady=18)
+        for text, variable, unit in (("点击", self.click_max_count_var, "次后停止"), ("运行", self.click_max_seconds_var, "秒后停止")):
+            ctk.CTkLabel(limits, text=text, text_color=COLOR_MUTED, font=self._t("body")).pack(side="left", padx=(0, 6))
+            entry = ctk.CTkEntry(limits, textvariable=variable, width=90, height=36, corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("body"))
+            entry.pack(side="left", padx=(0, 6))
+            ctk.CTkLabel(limits, text=unit, text_color=COLOR_MUTED, font=self._t("body")).pack(side="left", padx=(0, 26))
+        ctk.CTkLabel(limits, text="0 = 不限", text_color=COLOR_MUTED, font=self._t("hint")).pack(side="left")
 
-        action = ctk.CTkFrame(wrap, fg_color=COLOR_SURFACE, corner_radius=16, border_width=1, border_color=COLOR_BORDER)
+        action = ctk.CTkFrame(wrap, fg_color=COLOR_SURFACE, corner_radius=RADIUS_CARD, border_width=1, border_color=COLOR_BORDER)
         action.pack(fill="both", expand=True)
         action.grid_columnconfigure(0, weight=1)
         action.grid_rowconfigure(0, weight=1)
 
         center = ctk.CTkFrame(action, fg_color="transparent")
-        center.grid(row=0, column=0, pady=50)
+        center.grid(row=0, column=0, pady=30)
 
-        self.click_start_button = ctk.CTkButton(center, text="▶  开始连点" if not self.clicker.running.is_set() else "■  停止连点", width=420, height=60, corner_radius=14, fg_color=COLOR_ACCENT if not self.clicker.running.is_set() else COLOR_DANGER, hover_color=COLOR_ACCENT_HOVER if not self.clicker.running.is_set() else COLOR_DANGER_HOVER, text_color="#FFFFFF", font=self._font(20, "bold"), command=self.toggle_clicker)
+        self.click_start_button = ctk.CTkButton(center, text="▶  开始连点" if not self.clicker.running.is_set() else "■  停止连点", width=320, height=BUTTON_HEIGHT["md"], corner_radius=RADIUS_CONTROL, fg_color=COLOR_ACCENT if not self.clicker.running.is_set() else COLOR_DANGER, hover_color=COLOR_ACCENT_HOVER if not self.clicker.running.is_set() else COLOR_DANGER_HOVER, text_color="#FFFFFF", font=self._t("card_title"), command=self._on_click_start_button)
         self.click_start_button.pack(pady=(4, 18))
 
         self.click_tip_label = ctk.CTkLabel(center, text=self._click_tip_text(), text_color=COLOR_MUTED, font=self._font(16))
         self.click_tip_label.pack()
 
+        # 运行统计：已点击次数、运行时长、实际速度。
+        stats = ctk.CTkFrame(center, fg_color="transparent")
+        stats.pack(pady=(26, 0))
+        self.click_stat_labels = {}
+        for key, title in (("count", "已点击"), ("elapsed", "运行时长"), ("rate", "实际速度")):
+            box = ctk.CTkFrame(stats, fg_color=COLOR_SURFACE_2, corner_radius=RADIUS_CONTROL, border_width=1, border_color=COLOR_BORDER, width=150, height=72)
+            box.pack(side="left", padx=8)
+            box.pack_propagate(False)
+            ctk.CTkLabel(box, text=title, text_color=COLOR_MUTED, font=self._t("hint")).pack(pady=(10, 0))
+            value = ctk.CTkLabel(box, text="-", text_color=COLOR_TEXT, font=self._t("card_title"))
+            value.pack()
+            self.click_stat_labels[key] = value
+        self.click_stop_reason_label = ctk.CTkLabel(center, text="", text_color=COLOR_MUTED, font=self._t("body"))
+        self.click_stop_reason_label.pack(pady=(10, 0))
+        self._refresh_clicker_stats()
+
     def _click_type_row(self, parent):
-        ctk.CTkLabel(parent, text="点击类型", text_color=COLOR_TEXT, font=self._font(15, "bold")).grid(row=0, column=0, sticky="w", padx=(24, 22), pady=18)
+        ctk.CTkLabel(parent, text="点击类型", text_color=COLOR_TEXT, font=self._t("label")).grid(row=0, column=0, sticky="w", padx=(SPACE_CARD, 22), pady=18)
 
         box = ctk.CTkFrame(parent, fg_color="transparent")
         box.grid(row=0, column=1, sticky="w", pady=18)
 
         for text, val in [("鼠标左键", "left"), ("鼠标中键", "middle"), ("鼠标右键", "right")]:
-            ctk.CTkRadioButton(box, text=text, value=val, variable=self.click_button_var, command=self._refresh_click_tip, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(14)).pack(side="left", padx=(0, 42))
+            ctk.CTkRadioButton(box, text=text, value=val, variable=self.click_button_var, command=self._refresh_click_tip, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("body")).pack(side="left", padx=(0, 42))
 
     def _click_button_name(self):
         return {"left": "左键", "middle": "中键", "right": "右键"}.get(self.click_button_var.get(), "左键")
 
     def _click_tip_text(self):
         if self.clicker.running.is_set():
-            return f"正在执行{self._click_button_name()}连点"
-        return f"按  {self.hotkey_var.get()}  键开始{self._click_button_name()}连点"
+            return f"正在执行{self._click_button_name()}连点，按 {self.hotkey_var.get()} 停止"
+        if self._click_countdown_left:
+            return f"{self._click_countdown_left} 秒后开始，请把鼠标移到要点击的位置（再点一次按钮取消）"
+        return f"按  {self.hotkey_var.get()}  键立即开始{self._click_button_name()}连点；用按钮启动会先倒数 {CLICK_START_COUNTDOWN} 秒"
+
+    def _on_click_start_button(self):
+        """Button start: count down first so the mouse can leave the button. The hotkey still starts at once."""
+        if self.clicker.running.is_set():
+            self.toggle_clicker()
+            return
+        if self._click_countdown_left:
+            self._cancel_click_countdown()
+            return
+        self._click_countdown_left = CLICK_START_COUNTDOWN
+        self._tick_click_countdown()
+
+    def _tick_click_countdown(self):
+        self._click_countdown_job = None
+        if not self._click_countdown_left:
+            return
+        button = getattr(self, "click_start_button", None)
+        if button is not None and button.winfo_exists():
+            button.configure(text=f"⏱  {self._click_countdown_left} 秒后开始（点击取消）", fg_color=COLOR_WARNING, hover_color=COLOR_WARNING)
+            self._click_button_state = None  # 按钮被倒数改过，结束后必须重画
+        self._refresh_click_tip()
+        self._click_countdown_left -= 1
+        if self._click_countdown_left <= 0:
+            self._click_countdown_job = self.after(1000, self._finish_click_countdown)
+        else:
+            self._click_countdown_job = self.after(1000, self._tick_click_countdown)
+
+    def _finish_click_countdown(self):
+        self._click_countdown_job = None
+        self._click_countdown_left = 0
+        if not self.clicker.running.is_set():
+            self.toggle_clicker()
+        else:
+            self._refresh_clicker_button()
+
+    def _cancel_click_countdown(self):
+        if self._click_countdown_job:
+            try:
+                self.after_cancel(self._click_countdown_job)
+            except Exception:
+                pass
+        self._click_countdown_job = None
+        self._click_countdown_left = 0
+        self._click_button_state = None
+        self._refresh_clicker_button()
+
+    def _click_limits(self):
+        """Read the auto-stop limits; invalid or empty values count as 0 (no limit)."""
+        values = []
+        for var in (self.click_max_count_var, self.click_max_seconds_var):
+            try:
+                values.append(max(0, int(float(var.get().strip() or 0))))
+            except Exception:
+                values.append(0)
+        return values[0], values[1]
+
+    def _refresh_clicker_stats(self):
+        labels = getattr(self, "click_stat_labels", None)
+        if not labels or not labels["count"].winfo_exists():
+            return
+        clicker = self.clicker
+        if not clicker.started_at:
+            view = ("-", "-", "-", "")
+        else:
+            elapsed = clicker.elapsed_seconds()
+            rate = clicker.click_count / elapsed if elapsed >= 0.5 else 0
+            minutes, seconds = divmod(int(elapsed), 60)
+            reason = "" if clicker.running.is_set() else (f"上次运行：{clicker.stop_reason}" if clicker.stop_reason else "")
+            view = (f"{clicker.click_count} 次", f"{minutes:02d}:{seconds:02d}", f"{rate:.1f} 次/秒" if rate else "-", reason)
+        if view == getattr(self, "_click_stats_view", None):
+            return  # 没变化不重画
+        self._click_stats_view = view
+        labels["count"].configure(text=view[0])
+        labels["elapsed"].configure(text=view[1])
+        labels["rate"].configure(text=view[2])
+        self.click_stop_reason_label.configure(text=view[3])
+
+    def _on_clicker_auto_stopped(self):
+        # 工作线程回调，切回主线程更新界面。
+        try:
+            self.after(0, lambda: (self._set_task_phase("clicker", TaskPhase.IDLE), self._refresh_clicker_button(), self._refresh_clicker_stats()))
+        except Exception:
+            pass
 
     def _refresh_click_tip(self, *_):
         if hasattr(self, "click_tip_label"):
@@ -3298,7 +3746,15 @@ class XiaoXinAssistant(ctk.CTk):
         try:
             if not button.winfo_exists():
                 return
+            # 状态栏每 0.5 秒调用一次：顺便刷新统计；倒数中不覆盖按钮文字；状态没变不重画。
+            self._refresh_clicker_stats()
+            if self._click_countdown_left:
+                return
             running = self.clicker.running.is_set()
+            state = (button, running, self.hotkey_var.get(), self.click_button_var.get())
+            if state == getattr(self, "_click_button_state", None):
+                return
+            self._click_button_state = state
             button.configure(
                 text="■  停止连点" if running else "▶  开始连点",
                 fg_color=COLOR_DANGER if running else COLOR_ACCENT,
@@ -3334,11 +3790,16 @@ class XiaoXinAssistant(ctk.CTk):
         return self.clicker_custom_interval
 
     def toggle_clicker(self):
+        """Hotkey and button entry point. Starts immediately (the button path counts down first)."""
+        if self._click_countdown_left:
+            self._cancel_click_countdown()  # 倒数中按热键：直接取消倒数，立即开始
         if self.clicker.running.is_set():
             self.clicker.stop()
         else:
             try:
-                self.clicker.start(self._click_interval_seconds(), self.click_button_var.get())
+                max_clicks, max_seconds = self._click_limits()
+                self.clicker.on_auto_stop = self._on_clicker_auto_stopped
+                self.clicker.start(self._click_interval_seconds(), self.click_button_var.get(), max_clicks, max_seconds)
             except Exception as exc:
                 messagebox.showerror("启动失败", str(exc))
                 return
@@ -3358,8 +3819,8 @@ class XiaoXinAssistant(ctk.CTk):
 
         tabs = ctk.CTkTabview(
             wrap,
-            height=280,
-            corner_radius=14,
+            height=self.NETWORK_TABS_BASE_HEIGHT,
+            corner_radius=RADIUS_CARD,
             border_width=1,
             border_color=COLOR_BORDER,
             fg_color=COLOR_SURFACE,
@@ -3368,63 +3829,59 @@ class XiaoXinAssistant(ctk.CTk):
             segmented_button_selected_hover_color=COLOR_ACCENT_HOVER,
         )
         tabs.pack(fill="x", pady=(0, 10))
+        self.network_tabs = tabs
         basic_tab = tabs.add("基础设置")
         advanced_tab = tabs.add("进阶模拟")
         for tab in (basic_tab, advanced_tab):
             tab.grid_columnconfigure((0, 1), weight=1, uniform="network_settings")
 
-        def inline_entry(parent, row, col, label, variable, placeholder=""):
+        def inline_entry(parent, row, col, label, variable, placeholder="", columnspan=1):
             box = ctk.CTkFrame(parent, fg_color="transparent")
-            box.grid(row=row, column=col, sticky="ew", padx=(0, 12), pady=4)
+            box.grid(row=row, column=col, columnspan=columnspan, sticky="ew", padx=(0, 12), pady=4)
             box.grid_columnconfigure(1, weight=1)
-            ctk.CTkLabel(box, text=label, width=150, text_color=COLOR_MUTED, font=self._font(12), anchor="w").grid(row=0, column=0, sticky="w", padx=(0, 8))
-            entry = ctk.CTkEntry(box, textvariable=variable, placeholder_text=placeholder, height=34, corner_radius=9, fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(12))
+            ctk.CTkLabel(box, text=label, width=150, text_color=COLOR_MUTED, font=self._t("hint"), anchor="w").grid(row=0, column=0, sticky="w", padx=(0, 8))
+            entry = ctk.CTkEntry(box, textvariable=variable, placeholder_text=placeholder, height=34, corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("hint"))
             entry.grid(row=0, column=1, sticky="ew")
             return entry
 
-        self.network_parameter_widgets.append(
-            inline_entry(basic_tab, 0, 0, "目标 IP（可填多个）", self.target_ip_var, "留空 = 全部；多个用逗号分隔")
-        )
-        self.network_parameter_widgets.append(
-            inline_entry(basic_tab, 0, 1, "高级规则", self.advanced_filter_var, "可选，自动加安全保护")
-        )
+        self._build_network_target_input(basic_tab)
 
         def compact_option(parent, row, col, label, variable, values):
             box = ctk.CTkFrame(parent, fg_color="transparent")
             box.grid(row=row, column=col, sticky="ew", padx=(0, 12), pady=4)
             box.grid_columnconfigure(1, weight=1)
-            ctk.CTkLabel(box, text=label, width=150, text_color=COLOR_MUTED, font=self._font(12), anchor="w").grid(row=0, column=0, sticky="w", padx=(0, 8))
+            ctk.CTkLabel(box, text=label, width=150, text_color=COLOR_MUTED, font=self._t("hint"), anchor="w").grid(row=0, column=0, sticky="w", padx=(0, 8))
             menu = ctk.CTkOptionMenu(
                 box,
                 variable=variable,
                 values=values,
                 height=34,
-                corner_radius=9,
+                corner_radius=RADIUS_CONTROL,
                 fg_color=COLOR_SURFACE_2,
                 button_color=COLOR_SELECTED,
                 button_hover_color=COLOR_HOVER,
                 text_color=COLOR_TEXT,
-                font=self._font(12),
+                font=self._t("hint"),
             )
             menu.grid(row=0, column=1, sticky="ew")
             return menu
 
-        self.network_parameter_widgets.append(compact_option(basic_tab, 1, 0, "协议类型", self.protocol_var, ["全部", "TCP", "UDP", "ICMP"]))
-        self.network_parameter_widgets.append(compact_option(basic_tab, 1, 1, "方向", self.direction_var, ["全部", "出站", "入站"]))
-        self.network_parameter_widgets.append(inline_entry(basic_tab, 2, 0, "基础单向延迟（ms）", self.delay_var, "例如 300"))
-        self.network_parameter_widgets.append(inline_entry(basic_tab, 2, 1, "延迟抖动（±ms）", self.jitter_var, "0 = 固定延迟"))
-        self.network_parameter_widgets.append(inline_entry(basic_tab, 3, 0, "随机丢包概率", self.loss_var, "0～100"))
-        self.network_parameter_widgets.append(inline_entry(basic_tab, 3, 1, "数据包乱序概率", self.reorder_var, "0～100，默认关闭"))
+        self.network_parameter_widgets.append(compact_option(basic_tab, 2, 0, "协议类型", self.protocol_var, ["全部", "TCP", "UDP", "ICMP"]))
+        self.network_parameter_widgets.append(compact_option(basic_tab, 2, 1, "方向", self.direction_var, ["全部", "出站", "入站"]))
+        self.network_parameter_widgets.append(inline_entry(basic_tab, 3, 0, "基础单向延迟（ms）", self.delay_var, "例如 300"))
+        self.network_parameter_widgets.append(inline_entry(basic_tab, 3, 1, "延迟抖动（±ms）", self.jitter_var, "0 = 固定延迟"))
+        self.network_parameter_widgets.append(inline_entry(basic_tab, 4, 0, "随机丢包概率", self.loss_var, "0～100"))
+        self.network_parameter_widgets.append(inline_entry(basic_tab, 4, 1, "数据包乱序概率", self.reorder_var, "0～100，默认关闭"))
         delay_hint = ctk.CTkLabel(
             basic_tab,
             textvariable=self.network_delay_hint_var,
             text_color=COLOR_MUTED,
-            font=self._font(12),
+            font=self._t("hint"),
             anchor="w",
             justify="left",
             wraplength=860,
         )
-        delay_hint.grid(row=4, column=0, columnspan=2, sticky="ew", padx=(4, 12), pady=(4, 2))
+        delay_hint.grid(row=5, column=0, columnspan=2, sticky="ew", padx=(4, 12), pady=(4, 2))
 
         self.network_parameter_widgets.append(inline_entry(advanced_tab, 0, 0, "上行带宽", self.upload_bandwidth_var, "0 = 不限速"))
         self.network_parameter_widgets.append(inline_entry(advanced_tab, 0, 1, "下行带宽", self.download_bandwidth_var, "0 = 不限速"))
@@ -3432,6 +3889,10 @@ class XiaoXinAssistant(ctk.CTk):
         self.network_parameter_widgets.append(inline_entry(advanced_tab, 1, 1, "自动停止（分钟）", self.network_duration_var, "0 = 不自动停止"))
         self.network_parameter_widgets.append(inline_entry(advanced_tab, 2, 0, "突发丢包触发概率", self.burst_trigger_var, "0～100"))
         self.network_parameter_widgets.append(inline_entry(advanced_tab, 2, 1, "连续丢包数量", self.burst_length_var, "0 = 关闭"))
+        # 高级规则会覆盖目标 IP、协议和方向，放在进阶页。
+        self.network_parameter_widgets.append(
+            inline_entry(advanced_tab, 3, 0, "高级规则（WinDivert）", self.advanced_filter_var, "可选；填写后忽略目标 IP、协议和方向，自动加安全保护", columnspan=2)
+        )
 
         preset = ctk.CTkFrame(wrap, fg_color=COLOR_BG)
         preset.pack(fill="x", pady=(0, 10))
@@ -3449,8 +3910,8 @@ class XiaoXinAssistant(ctk.CTk):
             preset_button = ctk.CTkButton(
                 preset,
                 text=text,
-                height=34,
-                corner_radius=12,
+                height=BUTTON_HEIGHT["sm"],
+                corner_radius=RADIUS_CONTROL,
                 fg_color=COLOR_SURFACE,
                 hover_color=COLOR_HOVER,
                 border_width=1,
@@ -3462,63 +3923,265 @@ class XiaoXinAssistant(ctk.CTk):
             preset_button.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 4))
             self.network_parameter_widgets.append(preset_button)
 
-        action = ctk.CTkFrame(wrap, fg_color=COLOR_SURFACE, corner_radius=16, border_width=1, border_color=COLOR_BORDER)
+        action = ctk.CTkFrame(wrap, fg_color=COLOR_SURFACE, corner_radius=RADIUS_CARD, border_width=1, border_color=COLOR_BORDER)
         action.pack(fill="both", expand=True)
         action.grid_columnconfigure(0, weight=1)
         action.grid_rowconfigure(3, weight=1)
 
         actions = ctk.CTkFrame(action, fg_color="transparent")
-        actions.grid(row=0, column=0, pady=(18, 8))
-        self.network_button = ctk.CTkButton(actions, text="▶  开始模拟" if not self.network.running.is_set() else "■  停止模拟", width=320, height=48, corner_radius=14, fg_color=COLOR_ACCENT if not self.network.running.is_set() else COLOR_DANGER, hover_color=COLOR_ACCENT_HOVER if not self.network.running.is_set() else COLOR_DANGER_HOVER, text_color="#FFFFFF", font=self._font(18, "bold"), command=self.toggle_network)
+        actions.grid(row=0, column=0, pady=(12, 6))
+        self.network_button = ctk.CTkButton(actions, text="▶  开始模拟" if not self.network.running.is_set() else "■  停止模拟", width=320, height=BUTTON_HEIGHT["md"], corner_radius=RADIUS_CONTROL, fg_color=COLOR_ACCENT if not self.network.running.is_set() else COLOR_DANGER, hover_color=COLOR_ACCENT_HOVER if not self.network.running.is_set() else COLOR_DANGER_HOVER, text_color="#FFFFFF", font=self._t("card_title"), command=self.toggle_network)
         self.network_button.pack(side="left", padx=(0, 10))
         self.network_emergency_button = ctk.CTkButton(
             actions,
             text="立即恢复网络",
             width=150,
-            height=48,
-            corner_radius=14,
+            height=BUTTON_HEIGHT["md"],
+            corner_radius=RADIUS_CONTROL,
             fg_color="transparent",
             hover_color=COLOR_DANGER_HOVER,
             border_width=1,
             border_color=COLOR_DANGER,
             text_color=COLOR_DANGER,
-            font=self._font(14, "bold"),
+            font=self._t("label"),
             command=self._emergency_restore_network,
         )
         self.network_emergency_button.pack(side="left")
 
-        ctk.CTkLabel(action, textvariable=self.network_status_var, text_color=COLOR_TEXT, font=self._font(13, "bold")).grid(row=1, column=0, pady=(0, 6))
-        ctk.CTkLabel(action, textvariable=self.network_stats_var, text_color=COLOR_MUTED, font=self._font(12), justify="center").grid(row=2, column=0, pady=(0, 8))
+        ctk.CTkLabel(action, textvariable=self.network_status_var, text_color=COLOR_TEXT, font=self._t("label")).grid(row=1, column=0, pady=(0, 2))
+        ctk.CTkLabel(action, textvariable=self.network_stats_var, text_color=COLOR_MUTED, font=self._t("hint"), justify="center").grid(row=2, column=0, pady=(0, 6))
 
         self.network_bottom_frame = ctk.CTkFrame(action, fg_color="transparent")
         self.network_bottom_frame.grid(row=3, column=0, sticky="nsew", padx=20, pady=(0, 18))
         self.network_bottom_frame.grid_rowconfigure(0, weight=1)
-        self.network_bottom_frame.grid_columnconfigure((0, 1), weight=1, uniform="network_bottom")
+        self.network_bottom_frame.grid_columnconfigure(0, weight=1)
 
-        guide_panel = ctk.CTkFrame(self.network_bottom_frame, fg_color=COLOR_SURFACE_2, corner_radius=12, border_width=1, border_color=COLOR_BORDER)
-        guide_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        guide_panel.grid_columnconfigure(0, weight=1)
-        guide_panel.grid_rowconfigure(1, weight=1)
-        guide_header = ctk.CTkFrame(guide_panel, fg_color="transparent")
-        guide_header.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 2))
-        ctk.CTkLabel(guide_header, text="使用说明", text_color=COLOR_TEXT, font=self._font(13, "bold")).pack(side="left")
-        self.network_guide_toggle_button = ctk.CTkButton(guide_header, text="收起", width=54, height=24, fg_color="transparent", hover_color=COLOR_HOVER, text_color=COLOR_MUTED, command=self._toggle_network_guide)
-        self.network_guide_toggle_button.pack(side="right")
-        self.network_guide_box = ctk.CTkTextbox(guide_panel, height=115, fg_color="transparent", text_color=COLOR_MUTED, font=self._font(12), wrap="word")
-        self.network_guide_box.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
-        self.network_guide_box.insert("end", NETWORK_USAGE_GUIDE)
-        self.network_guide_box.configure(state="disabled")
-
-        log_panel = ctk.CTkFrame(self.network_bottom_frame, fg_color=COLOR_SURFACE_2, corner_radius=12, border_width=1, border_color=COLOR_BORDER)
-        log_panel.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        # 使用说明改为弹窗，运行日志占满整行。
+        log_panel = ctk.CTkFrame(self.network_bottom_frame, fg_color=COLOR_SURFACE_2, corner_radius=RADIUS_CONTROL, border_width=1, border_color=COLOR_BORDER)
+        log_panel.grid(row=0, column=0, sticky="nsew")
         log_panel.grid_columnconfigure(0, weight=1)
         log_panel.grid_rowconfigure(1, weight=1)
-        ctk.CTkLabel(log_panel, text="运行日志", text_color=COLOR_TEXT, font=self._font(13, "bold"), anchor="w").grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 2))
-        self.network_log_box = ctk.CTkTextbox(log_panel, height=115, fg_color="transparent", text_color=COLOR_TEXT, font=self._font(12), wrap="word")
+        log_header = ctk.CTkFrame(log_panel, fg_color="transparent")
+        log_header.grid(row=0, column=0, sticky="ew", padx=12, pady=(6, 0))
+        ctk.CTkLabel(log_header, text="运行日志", text_color=COLOR_TEXT, font=self._t("label"), anchor="w").pack(side="left")
+        ctk.CTkButton(
+            log_header, text="ⓘ  使用说明", width=96, height=24, corner_radius=8, fg_color="transparent",
+            hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_MUTED,
+            font=self._t("hint"), command=self._show_network_guide,
+        ).pack(side="right")
+        self.network_log_box = ctk.CTkTextbox(log_panel, height=115, fg_color="transparent", text_color=COLOR_TEXT, font=self._t("hint"), wrap="word")
         self.network_log_box.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
         self.network_log_box.insert("end", "等待启动。运行状态、生效规则和安全警告会显示在这里。\n")
         self.network_log_box.configure(state="disabled")
         self._refresh_network_button()
+
+    # 最多显示的标签数；实际显示几个还取决于这一行放得下多少。
+    NETWORK_TARGET_CHIPS = 6
+    # 目标 IP 输入框平时固定 2 行；只在编辑（获得焦点）时随内容长高到最多 4 行，
+    # 离开后收回，把高度还给下方运行日志。再高会把日志挤到只剩标题（1400x850 实测 6 行时如此）。
+    NETWORK_TARGET_MIN_LINES = 2
+    NETWORK_TARGET_MAX_LINES = 4
+    NETWORK_TARGET_LINE_GAP = 3  # 每行上下各留的像素，避免一行一个 IP 时挤在一起
+    NETWORK_TABS_BASE_HEIGHT = 318
+
+    def _network_target_box_height(self, lines):
+        line_height = self._font(12).metrics("linespace") + 2 * self.NETWORK_TARGET_LINE_GAP
+        return lines * line_height + 24  # 边框和内边距；太小时行数刚好也会出现滚动条
+
+    def _resize_network_target_box(self):
+        box = getattr(self, "network_target_box", None)
+        if box is None:
+            return
+        try:
+            counted = box._textbox.count("1.0", "end-1c", "displaylines")
+            lines = int(counted[0] if isinstance(counted, tuple) else counted or 0) + 1
+        except Exception:
+            lines = box.get("1.0", "end-1c").count("\n") + 1
+        max_lines = self.NETWORK_TARGET_MAX_LINES if self._network_target_editing else self.NETWORK_TARGET_MIN_LINES
+        lines = max(self.NETWORK_TARGET_MIN_LINES, min(max_lines, lines))
+        if lines == self._network_target_lines:
+            return
+        self._network_target_lines = lines
+        box.configure(height=self._network_target_box_height(lines))
+        # 选项卡高度是固定的，跟着输入框一起加高，避免下面的参数被挤出可见区域。
+        extra = self._network_target_box_height(lines) - self._network_target_box_height(self.NETWORK_TARGET_MIN_LINES)
+        tabs = getattr(self, "network_tabs", None)
+        if tabs is not None:
+            tabs.configure(height=self.NETWORK_TABS_BASE_HEIGHT + extra)
+
+    def _build_network_target_input(self, parent):
+        """Multi-line target IP box plus a live result row with the first few targets as chips."""
+        box = ctk.CTkFrame(parent, fg_color="transparent")
+        box.grid(row=0, column=0, columnspan=2, sticky="ew", padx=(0, 12), pady=(4, 0))
+        box.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(box, text="目标 IP（可填多个）", width=150, text_color=COLOR_MUTED, font=self._t("hint"), anchor="nw").grid(row=0, column=0, sticky="nw", padx=(0, 8), pady=(6, 0))
+        self.network_target_box = ctk.CTkTextbox(
+            box,
+            height=self._network_target_box_height(self.NETWORK_TARGET_MIN_LINES),
+            corner_radius=RADIUS_CONTROL,
+            border_width=2,
+            fg_color=COLOR_SURFACE_2,
+            border_color=COLOR_BORDER,
+            text_color=COLOR_TEXT,
+            font=self._t("hint"),
+            wrap="word",
+            activate_scrollbars=True,
+            spacing1=self.NETWORK_TARGET_LINE_GAP,
+            spacing3=self.NETWORK_TARGET_LINE_GAP,
+        )
+        self._network_target_lines = self.NETWORK_TARGET_MIN_LINES
+        self._network_target_editing = False
+        self.network_target_box.grid(row=0, column=1, sticky="ew")
+        current = self.target_ip_var.get()
+        if current:
+            self.network_target_box.insert("1.0", current)
+        self.network_target_box.edit_modified(False)
+        self.network_target_box.bind("<<Modified>>", self._on_network_target_modified)
+        self._network_target_editing = False
+        self.network_target_box.bind("<FocusIn>", lambda _e: self._set_network_target_editing(True), add="+")
+        self.network_target_box.bind("<FocusOut>", lambda _e: self._set_network_target_editing(False), add="+")
+        if not getattr(self, "_network_target_click_bound", False):
+            # 点按钮、空白处不会转移键盘焦点，这里补一下，让输入框能收回。
+            self.bind_all("<Button-1>", self._on_click_outside_network_target, add="+")
+            self._network_target_click_bound = True
+        self.network_parameter_widgets.append(self.network_target_box)
+
+        result = ctk.CTkFrame(box, fg_color="transparent")
+        result.grid(row=1, column=1, sticky="ew", pady=(4, 2))
+        self.network_target_result_row = result
+        self._network_target_row_width = 0
+        result.bind("<Configure>", self._on_network_target_row_resized, add="+")
+        self.network_target_status = ctk.CTkLabel(result, text="", text_color=COLOR_MUTED, font=self._t("hint"), anchor="w")
+        self.network_target_status.pack(side="left")
+        self.network_target_chips = []
+        for _ in range(self.NETWORK_TARGET_CHIPS):
+            chip = ctk.CTkLabel(result, text="", height=22, corner_radius=11, fg_color=COLOR_SELECTED, text_color=COLOR_ACCENT, font=self._font(11, "bold"))
+            self.network_target_chips.append(chip)
+        self.network_target_more = ctk.CTkLabel(result, text="", text_color=COLOR_MUTED, font=self._t("hint"))
+        clear_button = ctk.CTkButton(
+            result, text="清空", width=48, height=22, corner_radius=8, fg_color="transparent",
+            hover_color=COLOR_HOVER, text_color=COLOR_MUTED, font=self._t("hint"), command=self._clear_network_targets,
+        )
+        clear_button.pack(side="right")
+        self.network_target_clear_button = clear_button
+        self.network_parameter_widgets.append(clear_button)
+        self._network_target_view = None
+        self._network_target_refresh_job = None
+        self._refresh_network_target_summary()
+
+    def _on_network_target_modified(self, _event=None):
+        box = getattr(self, "network_target_box", None)
+        if box is None:
+            return
+        try:
+            if not box.edit_modified():
+                return
+            box.edit_modified(False)
+            self.target_ip_var.set(box.get("1.0", "end-1c"))
+        except Exception:
+            return
+        # 输入时合并刷新，避免每个按键都重画标签。
+        if self._network_target_refresh_job is not None:
+            try:
+                self.after_cancel(self._network_target_refresh_job)
+            except Exception:
+                pass
+        self._network_target_refresh_job = self.after(150, self._refresh_network_target_summary)
+
+    def _set_network_target_editing(self, editing):
+        if self._network_target_editing == editing:
+            return
+        self._network_target_editing = editing
+        self._resize_network_target_box()
+
+    def _on_click_outside_network_target(self, event):
+        if not getattr(self, "_network_target_editing", False):
+            return
+        box = getattr(self, "network_target_box", None)
+        if box is None:
+            return
+        try:
+            inner = box._textbox
+            # 点在输入框自身（含它的滚动条）上不收回。
+            widget = event.widget
+            while widget is not None:
+                if widget is box:
+                    return
+                widget = getattr(widget, "master", None)
+            # 点到其他输入框时它已经拿到焦点；只有焦点还留在 IP 输入框时才移走。
+            if self.focus_get() is inner:
+                self.focus_set()
+        except Exception:
+            pass
+
+    def _on_network_target_row_resized(self, event):
+        # 宽度变化后重新计算放得下几个标签；高度变化不用管。
+        if event.width == self._network_target_row_width:
+            return
+        self._network_target_row_width = event.width
+        if self._network_target_refresh_job is None:
+            self._network_target_refresh_job = self.after(150, self._refresh_network_target_summary)
+
+    def _clear_network_targets(self):
+        box = getattr(self, "network_target_box", None)
+        if box is None:
+            return
+        box.delete("1.0", "end")
+        self.target_ip_var.set("")
+        self._refresh_network_target_summary()
+        box.focus_set()
+
+    def _refresh_network_target_summary(self):
+        self._network_target_refresh_job = None
+        status_label = getattr(self, "network_target_status", None)
+        if status_label is None:
+            return
+        self._resize_network_target_box()
+        info = describe_ip_targets(self.target_ip_var.get(), max_chips=self.NETWORK_TARGET_CHIPS)
+        chip_texts = [f"  {name}  " for name in info["chips"]]
+        shown = self._fit_network_target_chips(info["message"], chip_texts)
+        more = info["more"] + len(chip_texts) - shown
+        view = (info["status"], info["message"], tuple(chip_texts[:shown]), more)
+        if view == self._network_target_view:
+            return
+        self._network_target_view = view
+        colors = {"ok": COLOR_SUCCESS, "warning": COLOR_WARNING, "error": COLOR_DANGER}
+        status_label.configure(text=info["message"], text_color=colors.get(info["status"], COLOR_MUTED))
+        self.network_target_box.configure(border_color=COLOR_DANGER if info["status"] == "error" else COLOR_BORDER)
+        for chip in self.network_target_chips:
+            chip.pack_forget()
+        self.network_target_more.pack_forget()
+        for chip, text in zip(self.network_target_chips, chip_texts[:shown]):
+            chip.configure(text=text)
+            chip.pack(side="left", padx=(8, 0))
+        if more:
+            self.network_target_more.configure(text=f"+{more} 个")
+            self.network_target_more.pack(side="left", padx=(8, 0))
+
+    def _fit_network_target_chips(self, message, chip_texts):
+        """How many chips fit in the result row next to the message and the clear button."""
+        row_width = self.network_target_result_row.winfo_width()
+        if row_width <= 1:
+            return len(chip_texts)  # 尚未布局；布局完成后 <Configure> 会再算一次
+        # CTkFont.measure 是未缩放的宽度，按系统缩放（如 125%）换算成实际像素。
+        try:
+            scale = float(self.network_target_result_row._get_widget_scaling())
+        except Exception:
+            scale = 1.0
+        message_font = self._font(12)
+        chip_font = self._font(11, "bold")
+        # 实测 CTkLabel 宽度 = 文字宽度 + 2 × 圆角半径（标签圆角 11）；再加标签之间 8 像素间距。
+        used = (message_font.measure(message) + 22) * scale + self.network_target_clear_button.winfo_reqwidth() + 8 * scale
+        reserve = (message_font.measure("+999 个") + 22 + 8) * scale
+        shown = 0
+        for index, text in enumerate(chip_texts):
+            width = (chip_font.measure(text) + 22 + 8) * scale
+            limit = row_width - (reserve if index < len(chip_texts) - 1 else 0)
+            if used + width > limit:
+                break
+            used += width
+            shown += 1
+        return shown
 
     def _apply_network_preset(
         self,
@@ -3547,22 +4210,40 @@ class XiaoXinAssistant(ctk.CTk):
         self.burst_length_var.set(burst_length)
         self.network_duration_var.set(duration)
 
-    def _toggle_network_guide(self):
-        box = getattr(self, "network_guide_box", None)
-        button = getattr(self, "network_guide_toggle_button", None)
-        frame = getattr(self, "network_bottom_frame", None)
-        if box is None or button is None or frame is None:
-            return
-        self.network_guide_visible = not self.network_guide_visible
-        if self.network_guide_visible:
-            box.grid()
-            button.configure(text="收起")
-            frame.grid_columnconfigure((0, 1), weight=1, uniform="network_bottom")
-        else:
-            box.grid_remove()
-            button.configure(text="展开")
-            frame.grid_columnconfigure(0, weight=0, minsize=150, uniform="")
-            frame.grid_columnconfigure(1, weight=1, uniform="")
+    def _show_network_guide(self):
+        """Show the network usage guide in a reusable, non-blocking dialog."""
+        dialog = getattr(self, "_network_guide_dialog", None)
+        try:
+            if dialog is not None and dialog.winfo_exists():
+                dialog.deiconify()
+                dialog.lift()
+                dialog.focus_force()
+                return
+        except Exception:
+            pass
+        top = ctk.CTkToplevel(self)
+        top.title("网络弱网 · 使用说明")
+        width, height = 640, 520
+        try:
+            x = self.winfo_rootx() + max(0, (self.winfo_width() - width) // 2)
+            y = self.winfo_rooty() + max(0, (self.winfo_height() - height) // 2)
+            top.geometry(f"{width}x{height}+{x}+{y}")
+        except Exception:
+            top.geometry(f"{width}x{height}")
+        top.transient(self)
+        top.configure(fg_color=COLOR_BG)
+        top.grid_columnconfigure(0, weight=1)
+        top.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(top, text="使用说明", text_color=COLOR_TEXT, font=self._t("card_title"), anchor="w").grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 8))
+        box = ctk.CTkTextbox(top, corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("body"), wrap="char", spacing3=6)
+        box.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 12))
+        # 第一行“使用说明”已作为标题显示。
+        box.insert("1.0", NETWORK_USAGE_GUIDE.split("\n", 1)[-1].strip())
+        box.configure(state="disabled")
+        ctk.CTkButton(top, text="关闭", width=88, height=BUTTON_HEIGHT["sm"], corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("label"), command=top.destroy).grid(row=2, column=0, sticky="e", padx=18, pady=(0, 16))
+        top.bind("<Escape>", lambda _e: top.destroy())
+        self._network_guide_dialog = top
+        top.after(50, top.lift)
 
     def _emergency_restore_network(self):
         if not self.network.running.is_set():
@@ -3610,6 +4291,11 @@ class XiaoXinAssistant(ctk.CTk):
                 text, color, hover, state = "■  停止模拟", COLOR_DANGER, COLOR_DANGER_HOVER, "normal"
             else:
                 text, color, hover, state = "▶  开始模拟", COLOR_ACCENT, COLOR_ACCENT_HOVER, "normal"
+            # 状态栏每 0.5 秒会调用一次这里。CTk 控件每次 configure 都会整块重画，
+            # 状态没变时跳过，避免停在网络弱网页时界面周期性卡顿。
+            ui_state = (button, phase)
+            if getattr(self, "_network_ui_state", None) == ui_state:
+                return
             button.configure(
                 text=text,
                 fg_color=color,
@@ -3622,6 +4308,7 @@ class XiaoXinAssistant(ctk.CTk):
                     state="normal" if phase in (TaskPhase.STARTING, TaskPhase.RUNNING) else "disabled"
                 )
             self._set_network_controls_locked(phase in (TaskPhase.STARTING, TaskPhase.RUNNING, TaskPhase.STOPPING))
+            self._network_ui_state = ui_state
         except Exception:
             pass
 
@@ -3846,7 +4533,7 @@ class XiaoXinAssistant(ctk.CTk):
             segmented_button_unselected_color=COLOR_SURFACE_2,
             segmented_button_unselected_hover_color=COLOR_HOVER,
             text_color=COLOR_TEXT,
-            corner_radius=12,
+            corner_radius=RADIUS_CONTROL,
         )
         self.adb_log_page_tabs = page_tabs
         page_tabs.grid(row=0, column=0, sticky="nsew")
@@ -3856,7 +4543,7 @@ class XiaoXinAssistant(ctk.CTk):
         for tab in (control_tab, task_tab, log_tab):
             tab.configure(fg_color=COLOR_BG)
             tab.grid_columnconfigure(0, weight=1)
-        control_tab.grid_rowconfigure(1, weight=1)
+        control_tab.grid_rowconfigure(2, weight=1)  # 实时日志预览占满剩余高度
         task_tab.grid_rowconfigure(0, weight=1)
         log_tab.grid_rowconfigure(0, weight=1)
 
@@ -3867,50 +4554,83 @@ class XiaoXinAssistant(ctk.CTk):
             config_card,
             text="Android 日志抓取",
             text_color=COLOR_TEXT,
-            font=self._font(18, "bold"),
-        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=24, pady=(18, 8))
-        self._entry_row(config_card, 1, "应用包名", self.log_pkg_var, "例如 com.tinywarsurvivalexpress.android", width=520)
+            font=self._t("card_title"),
+        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=SPACE_CARD, pady=(18, 8))
+        # 包名：可直接输入，也可从最近用过的包名里选，或一键识别手机前台应用。
+        pkg_row = ctk.CTkFrame(config_card, fg_color="transparent")
+        pkg_row.grid(row=1, column=0, columnspan=3, sticky="ew", padx=SPACE_CARD, pady=(4, 8))
+        pkg_row.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(pkg_row, text="应用包名", text_color=COLOR_TEXT, font=self._t("label")).grid(row=0, column=0, sticky="w", padx=(0, 22))
+        self.adb_log_pkg_combo = ctk.CTkComboBox(
+            pkg_row,
+            variable=self.log_pkg_var,
+            values=self._load_recent_packages() or [self.log_pkg_var.get()],
+            height=40,
+            corner_radius=10,
+            fg_color=COLOR_SURFACE_2,
+            border_color=COLOR_BORDER,
+            button_color=COLOR_SURFACE_2,
+            button_hover_color=COLOR_HOVER,
+            dropdown_fg_color=COLOR_SURFACE,
+            dropdown_hover_color=COLOR_HOVER,
+            dropdown_text_color=COLOR_TEXT,
+            text_color=COLOR_TEXT,
+            font=self._t("body"),
+            dropdown_font=self._t("body"),
+        )
+        self.adb_log_pkg_combo.grid(row=0, column=1, sticky="ew", padx=(0, 10))
+        ctk.CTkButton(pkg_row, text="识别前台应用", width=118, height=40, corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("label"), command=self.adb_log_detect_foreground_package).grid(row=0, column=2, sticky="e")
 
-        # 第一行：设备操作栏。复用 ADB 多设备选择器，保留 serial 绑定逻辑。
+        # 设备操作栏。复用 ADB 多设备选择器，保留 serial 绑定逻辑。
         self._build_adb_device_selector(config_card, 2, show_actions=True)
 
-        # 第二行：日志操作栏。所有运行状态统一进入摘要卡片和任务表，不再在按钮区堆叠文本。
+        # 主操作：一个开始/停止主按钮 + 多设备时用的“停止选中设备”；其余低频操作收成一行文字按钮。
         action_row = ctk.CTkFrame(config_card, fg_color="transparent")
-        action_row.grid(row=3, column=0, columnspan=3, sticky="ew", padx=24, pady=(0, 18))
-        # v2.4.31: narrow-window friendly action layout. Split buttons into
-        # two rows and avoid placing six fixed-width buttons on one line.
-        for col in range(5):
-            action_row.grid_columnconfigure(col, weight=0)
-        action_row.grid_columnconfigure(5, weight=1)
-
-        ctk.CTkButton(action_row, text="清空已选 logcat", width=132, height=36, corner_radius=12, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13, "bold"), command=self.clear_selected_adb_logcat).grid(row=0, column=0, padx=(0, 10), pady=4, sticky="w")
-        ctk.CTkButton(action_row, text="开始抓取已选", width=132, height=36, corner_radius=12, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, text_color="#FFFFFF", font=self._font(13, "bold"), command=self.start_selected_adb_log).grid(row=0, column=1, padx=(0, 10), pady=4, sticky="w")
-        ctk.CTkButton(action_row, text="停止选中设备", width=132, height=36, corner_radius=12, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13, "bold"), command=self.stop_selected_adb_log).grid(row=0, column=2, padx=(0, 10), pady=4, sticky="w")
-        ctk.CTkButton(action_row, text="停止全部", width=108, height=36, corner_radius=12, fg_color=COLOR_DANGER, hover_color=COLOR_DANGER_HOVER, text_color="#FFFFFF", font=self._font(13, "bold"), command=self.stop_all_adb_log).grid(row=0, column=3, padx=(0, 10), pady=4, sticky="w")
-        ctk.CTkButton(action_row, text="打开日志目录", width=132, height=36, corner_radius=12, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13, "bold"), command=self.open_adb_log_dir).grid(row=1, column=0, padx=(0, 10), pady=(6, 4), sticky="w")
-        ctk.CTkButton(action_row, text="复制日志目录", width=132, height=36, corner_radius=12, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13, "bold"), command=self.copy_adb_log_dir).grid(row=1, column=1, padx=(0, 10), pady=(6, 4), sticky="w")
-
-        # 保留“当前设备”兼容入口，但不再把文件路径和任务详情堆在按钮区。
-        self.adb_log_button = ctk.CTkButton(action_row, text="▶  当前设备", width=132, height=36, corner_radius=12, fg_color=COLOR_ACCENT if not self.adb_log.running.is_set() else COLOR_DANGER, hover_color=COLOR_ACCENT_HOVER if not self.adb_log.running.is_set() else COLOR_DANGER_HOVER, text_color="#FFFFFF", font=self._font(13, "bold"), command=self.toggle_adb_log)
-        self.adb_log_button.grid(row=1, column=2, padx=(0, 10), pady=(6, 4), sticky="w")
-        ctk.CTkLabel(action_row, textvariable=self.adb_status_var, text_color=COLOR_MUTED, font=self._font(12)).grid(row=1, column=3, columnspan=3, sticky="w", padx=(0, 10), pady=(6, 4))
+        action_row.grid(row=3, column=0, columnspan=3, sticky="ew", padx=SPACE_CARD, pady=(0, 18))
+        action_row.grid_columnconfigure(2, weight=1)
+        self.adb_log_button = ctk.CTkButton(action_row, text="▶  开始抓取", width=168, height=40, corner_radius=RADIUS_CONTROL, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, text_color="#FFFFFF", font=self._t("label"), command=self._toggle_adb_log_primary)
+        self.adb_log_button.grid(row=0, column=0, padx=(0, 10), sticky="w")
+        ctk.CTkButton(action_row, text="停止选中设备", width=120, height=40, corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("label"), command=self.stop_selected_adb_log).grid(row=0, column=1, padx=(0, 12), sticky="w")
+        ctk.CTkLabel(action_row, textvariable=self.adb_status_var, text_color=COLOR_MUTED, font=self._t("hint"), anchor="w").grid(row=0, column=2, sticky="ew")
+        minor = ctk.CTkFrame(action_row, fg_color="transparent")
+        minor.grid(row=0, column=3, sticky="e")
+        for text, command in (
+            ("清空 logcat", self.clear_selected_adb_logcat),
+            ("打开日志目录", self.open_adb_log_dir),
+            ("复制日志目录", self.copy_adb_log_dir),
+        ):
+            ctk.CTkButton(minor, text=text, width=10, height=28, corner_radius=8, fg_color="transparent", hover_color=COLOR_HOVER, text_color=COLOR_MUTED, font=self._t("hint"), command=command).pack(side="left", padx=(6, 0))
 
         self._build_adb_log_summary_card(control_tab)
+
+        preview_card = ctk.CTkFrame(control_tab, fg_color=COLOR_SURFACE, corner_radius=RADIUS_CARD, border_width=1, border_color=COLOR_BORDER)
+        preview_card.grid(row=2, column=0, sticky="nsew")
+        preview_card.grid_columnconfigure(0, weight=1)
+        preview_card.grid_rowconfigure(1, weight=1)
+        preview_head = ctk.CTkFrame(preview_card, fg_color="transparent")
+        preview_head.grid(row=0, column=0, sticky="ew", padx=20, pady=(12, 4))
+        ctk.CTkLabel(preview_head, text="实时日志", text_color=COLOR_TEXT, font=self._t("label")).pack(side="left")
+        ctk.CTkLabel(preview_head, text=f"最近 {ADB_LIVE_PREVIEW_LINES} 行预览，完整日志保存在日志目录", text_color=COLOR_MUTED, font=self._t("hint")).pack(side="left", padx=(10, 0))
+        self.adb_live_preview_box = ctk.CTkTextbox(preview_card, height=90, corner_radius=RADIUS_CONTROL, border_width=1, border_color=COLOR_BORDER, fg_color=COLOR_SURFACE_2, text_color=COLOR_TEXT, font=self._t("hint"), wrap="none")
+        self.adb_live_preview_box.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 14))
+        self.adb_live_preview_box.insert("end", "开始抓取后，这里会显示最新的 logcat 内容。\n")
+        self.adb_live_preview_box.configure(state="disabled")
+        self._adb_live_preview_has_hint = True
 
         task_card = ctk.CTkFrame(task_tab, fg_color=COLOR_SURFACE, corner_radius=0)
         task_card.grid(row=0, column=0, sticky="nsew")
         task_card.grid_columnconfigure(0, weight=1)
         task_card.grid_rowconfigure(1, weight=1)
-        ctk.CTkLabel(task_card, text="设备日志任务", text_color=COLOR_TEXT, font=self._font(16, "bold")).grid(row=0, column=0, sticky="w", padx=24, pady=(10, 6))
+        ctk.CTkLabel(task_card, text="设备日志任务", text_color=COLOR_TEXT, font=self._t("card_title")).grid(row=0, column=0, sticky="w", padx=SPACE_CARD, pady=(10, 6))
         self._build_adb_log_task_table(task_card)
 
         log_card = ctk.CTkFrame(log_tab, fg_color=COLOR_SURFACE, corner_radius=0)
         log_card.grid(row=0, column=0, sticky="nsew")
         log_card.grid_columnconfigure(0, weight=1)
         log_card.grid_rowconfigure(1, weight=1)
-        ctk.CTkLabel(log_card, text="运行日志", text_color=COLOR_TEXT, font=self._font(16, "bold")).grid(row=0, column=0, sticky="w", padx=24, pady=(10, 6))
-        self.adb_log_box = ctk.CTkTextbox(log_card, corner_radius=14, border_width=1, border_color=COLOR_BORDER, fg_color=COLOR_SURFACE_2, text_color=COLOR_TEXT, font=self._font(13))
-        self.adb_log_box.grid(row=1, column=0, sticky="nsew", padx=24, pady=(0, 12))
+        ctk.CTkLabel(log_card, text="运行日志", text_color=COLOR_TEXT, font=self._t("card_title")).grid(row=0, column=0, sticky="w", padx=SPACE_CARD, pady=(10, 6))
+        self.adb_log_box = ctk.CTkTextbox(log_card, corner_radius=14, border_width=1, border_color=COLOR_BORDER, fg_color=COLOR_SURFACE_2, text_color=COLOR_TEXT, font=self._t("body"))
+        self.adb_log_box.grid(row=1, column=0, sticky="nsew", padx=SPACE_CARD, pady=(0, 12))
         self.adb_log_box.insert("end", "提示：请先连接安卓设备，开启 USB 调试，并在手机上允许调试授权。多设备抓取时，每台设备会生成独立日志文件。\n")
         self.adb_log_box.configure(state="disabled")
         self._refresh_adb_button()
@@ -3920,30 +4640,41 @@ class XiaoXinAssistant(ctk.CTk):
 
     def _build_adb_log_summary_card(self, parent):
         """Build compact two-column summary cards for narrow windows."""
-        summary = ctk.CTkFrame(parent, fg_color=COLOR_SURFACE, corner_radius=16, border_width=1, border_color=COLOR_BORDER)
+        summary = ctk.CTkFrame(parent, fg_color=COLOR_SURFACE, corner_radius=RADIUS_CARD, border_width=1, border_color=COLOR_BORDER)
         summary.grid(row=1, column=0, sticky="ew", pady=(0, 12))
-        summary.grid_columnconfigure(0, weight=1)
-        summary.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(summary, text="运行状态", text_color=COLOR_TEXT, font=self._font(16, "bold")).grid(row=0, column=0, sticky="w", padx=24, pady=(16, 8), columnspan=2)
+        # 4 项指标排成一行（原来两行），给下面的“实时日志”留出高度，最小窗口下也能看到日志。
+        # 包名和目录比较长，给它们两倍宽度。
+        for col, weight in enumerate((1, 2, 2, 1)):
+            summary.grid_columnconfigure(col, weight=weight)
+        ctk.CTkLabel(summary, text="运行状态", text_color=COLOR_TEXT, font=self._t("card_title")).grid(row=0, column=0, sticky="w", padx=SPACE_CARD, pady=(12, 6), columnspan=4)
 
         if not hasattr(self, "adb_log_running_count_var"):
             self.adb_log_running_count_var = tk.StringVar(value="0")
-            self.adb_log_pkg_summary_var = tk.StringVar(value=DEFAULT_PKG_NAME)
-            self.adb_log_dir_summary_var = tk.StringVar(value=self._short_path(self.adb_log.log_dir, 42))
+            self.adb_log_pkg_summary_var = tk.StringVar(value=self._short_middle(DEFAULT_PKG_NAME, 24))
+            self.adb_log_dir_summary_var = tk.StringVar(value=self._short_path(self.adb_log.log_dir, 26))
             self.adb_log_updated_summary_var = tk.StringVar(value="-")
 
-        self._summary_metric(summary, 1, 0, "运行中设备", self.adb_log_running_count_var)
-        self._summary_metric(summary, 1, 1, "当前包名", self.adb_log_pkg_summary_var)
-        self._summary_metric(summary, 2, 0, "日志目录", self.adb_log_dir_summary_var)
-        self._summary_metric(summary, 2, 1, "最后更新时间", self.adb_log_updated_summary_var)
+        self._summary_metric(summary, 1, 0, "运行中设备", self.adb_log_running_count_var, last_col=3)
+        self._summary_metric(summary, 1, 1, "当前包名", self.adb_log_pkg_summary_var, last_col=3)
+        self._summary_metric(summary, 1, 2, "日志目录", self.adb_log_dir_summary_var, last_col=3)
+        self._summary_metric(summary, 1, 3, "最后更新时间", self.adb_log_updated_summary_var, last_col=3)
 
-    def _summary_metric(self, parent, row, col, label, variable):
-        box = ctk.CTkFrame(parent, fg_color=COLOR_SURFACE_2, corner_radius=12, border_width=1, border_color=COLOR_BORDER)
-        box.grid(row=row, column=col, sticky="ew", padx=(24 if col == 0 else 8, 24 if col == 1 else 8), pady=(0, 10 if row == 1 else 16))
+    def _summary_metric(self, parent, row, col, label, variable, last_col=1):
+        box = ctk.CTkFrame(parent, fg_color=COLOR_SURFACE_2, corner_radius=RADIUS_CONTROL, border_width=1, border_color=COLOR_BORDER)
+        box.grid(row=row, column=col, sticky="ew", padx=(SPACE_CARD if col == 0 else 4, SPACE_CARD if col == last_col else 4), pady=(0, 14))
         box.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(box, text=label, text_color=COLOR_MUTED, font=self._font(12), anchor="w").grid(row=0, column=0, sticky="ew", padx=14, pady=(8, 1))
-        value_label = ctk.CTkLabel(box, textvariable=variable, text_color=COLOR_TEXT, font=self._font(13, "bold"), anchor="w")
+        ctk.CTkLabel(box, text=label, text_color=COLOR_MUTED, font=self._t("hint"), anchor="w").grid(row=0, column=0, sticky="ew", padx=14, pady=(8, 1))
+        value_label = ctk.CTkLabel(box, textvariable=variable, text_color=COLOR_TEXT, font=self._t("label"), anchor="w")
         value_label.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 8))
+
+    @staticmethod
+    def _short_middle(text, max_chars=24):
+        """Keep the start and end, e.g. com.tinywar…ess.android (package names have no path separators)."""
+        value = str(text or "").strip()
+        if len(value) <= max_chars:
+            return value or "-"
+        keep = max_chars - 1
+        return f"{value[:keep - keep // 2]}…{value[-(keep // 2):]}"
 
     @staticmethod
     def _short_path(path, max_chars=58):
@@ -3987,8 +4718,8 @@ class XiaoXinAssistant(ctk.CTk):
             if updated and (latest == "-" or updated > latest):
                 latest = updated
         self.adb_log_running_count_var.set(str(running_count))
-        self.adb_log_pkg_summary_var.set(self._short_path(self.log_pkg_var.get() or DEFAULT_PKG_NAME, 38))
-        self.adb_log_dir_summary_var.set(self._short_path(self.adb_log.log_dir, 42))
+        self.adb_log_pkg_summary_var.set(self._short_middle(self.log_pkg_var.get() or DEFAULT_PKG_NAME, 24))
+        self.adb_log_dir_summary_var.set(self._short_path(self.adb_log.log_dir, 26))
         self.adb_log_updated_summary_var.set(latest)
 
     def _schedule_adb_log_task_refresh(self):
@@ -4046,8 +4777,8 @@ class XiaoXinAssistant(ctk.CTk):
             messagebox.showerror("复制失败", str(exc))
 
     def _build_adb_log_task_table(self, parent):
-        table_frame = ctk.CTkFrame(parent, fg_color=COLOR_SURFACE_2, corner_radius=12, border_width=1, border_color=COLOR_BORDER)
-        table_frame.grid(row=1, column=0, sticky="nsew", padx=24, pady=(0, 16))
+        table_frame = ctk.CTkFrame(parent, fg_color=COLOR_SURFACE_2, corner_radius=RADIUS_CONTROL, border_width=1, border_color=COLOR_BORDER)
+        table_frame.grid(row=1, column=0, sticky="nsew", padx=SPACE_CARD, pady=(0, 16))
         table_frame.grid_columnconfigure(0, weight=1)
         table_frame.grid_rowconfigure(0, weight=1)
         columns = ("checked", "serial", "model", "android", "status", "log_status", "file_size", "log_file", "action")
@@ -4417,7 +5148,7 @@ class XiaoXinAssistant(ctk.CTk):
         if hasattr(self, "adb_log_button") and self.adb_log_button.winfo_exists():
             running = self.adb_log.running.is_set()
             self.adb_log_button.configure(
-                text="■  停止当前" if running else "▶  当前设备",
+                text="■  停止全部抓取" if running else "▶  开始抓取",
                 fg_color=COLOR_DANGER if running else COLOR_ACCENT,
                 hover_color=COLOR_DANGER_HOVER if running else COLOR_ACCENT_HOVER
             )
@@ -4470,7 +5201,7 @@ class XiaoXinAssistant(ctk.CTk):
             segmented_button_unselected_color=COLOR_SURFACE_2,
             segmented_button_unselected_hover_color=COLOR_HOVER,
             text_color=COLOR_TEXT,
-            corner_radius=12,
+            corner_radius=RADIUS_CONTROL,
         )
         tabview.grid(row=0, column=0, sticky="nsew")
 
@@ -4484,50 +5215,56 @@ class XiaoXinAssistant(ctk.CTk):
             tab.grid_rowconfigure(0, weight=1)
 
         # 关键字配置：控件只在进入页面时创建一次，后续刷新只更新变量值。
-        config_card = ctk.CTkFrame(config_tab, fg_color=COLOR_SURFACE, corner_radius=16, border_width=1, border_color=COLOR_BORDER)
+        config_card = ctk.CTkFrame(config_tab, fg_color=COLOR_SURFACE, corner_radius=RADIUS_CARD, border_width=1, border_color=COLOR_BORDER)
         config_card.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
         config_card.grid_columnconfigure(0, weight=0)
         config_card.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(config_card, text="关键字监控配置", text_color=COLOR_TEXT, font=self._font(18, "bold")).grid(row=0, column=0, sticky="w", padx=24, pady=(20, 10), columnspan=2)
-        ctk.CTkCheckBox(config_card, text="启用实时关键字监控", variable=self.log_analysis_enabled_var, text_color=COLOR_TEXT, font=self._font(14)).grid(row=1, column=0, sticky="w", padx=24, pady=(0, 12), columnspan=2)
+        ctk.CTkLabel(config_card, text="关键字监控配置", text_color=COLOR_TEXT, font=self._t("card_title")).grid(row=0, column=0, sticky="w", padx=SPACE_CARD, pady=(20, 10), columnspan=2)
+        ctk.CTkCheckBox(config_card, text="启用实时关键字监控", variable=self.log_analysis_enabled_var, text_color=COLOR_TEXT, font=self._t("body")).grid(row=1, column=0, sticky="w", padx=SPACE_CARD, pady=(0, 12), columnspan=2)
 
         keyword_frame = ctk.CTkFrame(config_card, fg_color=COLOR_SURFACE)
-        keyword_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=24, pady=(0, 12))
+        keyword_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=SPACE_CARD, pady=(0, 12))
         for col in range(3):
-            keyword_frame.grid_columnconfigure(col, weight=1, uniform="log_keywords")
+            # 不用等宽列：列宽至少等于该列最长的关键字，长关键字不会被截断。
+            keyword_frame.grid_columnconfigure(col, weight=1)
         for idx, keyword in enumerate(DEFAULT_KEYWORDS):
             ctk.CTkCheckBox(
                 keyword_frame,
                 text=keyword,
                 variable=self.log_keyword_vars[keyword],
-                width=190,
+                width=0,  # 按文字宽度，长关键字（如 IndexOutOfBoundsException）不会被截断
                 text_color=COLOR_TEXT,
-                font=self._font(13),
+                font=self._t("body"),
                 command=self.apply_log_analysis_config,
-            ).grid(row=idx // 3, column=idx % 3, sticky="w", padx=(0, 12), pady=5)
+            ).grid(row=idx // 3, column=idx % 3, sticky="w", padx=(0, 8), pady=5)
 
-        ctk.CTkLabel(config_card, text="自定义关键字（每行一个）", text_color=COLOR_TEXT, font=self._font(15, "bold")).grid(row=3, column=0, sticky="nw", padx=(24, 22), pady=(12, 8))
-        self.log_custom_keywords_textbox = ctk.CTkTextbox(config_card, height=120, corner_radius=12, border_width=1, border_color=COLOR_BORDER, fg_color=COLOR_SURFACE_2, text_color=COLOR_TEXT, font=self._font(13))
-        self.log_custom_keywords_textbox.grid(row=3, column=1, sticky="ew", padx=(0, 24), pady=(12, 8))
+        ctk.CTkLabel(config_card, text="自定义关键字（每行一个）", text_color=COLOR_TEXT, font=self._t("label")).grid(row=3, column=0, sticky="nw", padx=(SPACE_CARD, 22), pady=(12, 8))
+        self.log_custom_keywords_textbox = ctk.CTkTextbox(config_card, height=120, corner_radius=RADIUS_CONTROL, border_width=1, border_color=COLOR_BORDER, fg_color=COLOR_SURFACE_2, text_color=COLOR_TEXT, font=self._t("body"))
+        self.log_custom_keywords_textbox.grid(row=3, column=1, sticky="ew", padx=(0, SPACE_CARD), pady=(12, 8))
         self.log_custom_keywords_textbox.insert("end", "")
 
         option_row = ctk.CTkFrame(config_card, fg_color=COLOR_SURFACE)
-        option_row.grid(row=4, column=0, columnspan=2, sticky="ew", padx=24, pady=(0, 18))
+        option_row.grid(row=4, column=0, columnspan=2, sticky="ew", padx=SPACE_CARD, pady=(0, 18))
         for col in range(6):
             option_row.grid_columnconfigure(col, weight=0)
-        ctk.CTkLabel(option_row, text="上下文行数", text_color=COLOR_TEXT, font=self._font(14, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        ctk.CTkLabel(option_row, text="上下文行数", text_color=COLOR_TEXT, font=self._t("label")).grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
         ctk.CTkEntry(option_row, textvariable=self.log_context_lines_var, width=80, height=36, corner_radius=10, fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER, text_color=COLOR_TEXT).grid(row=0, column=1, sticky="w", padx=(0, 14), pady=4)
-        ctk.CTkCheckBox(option_row, text="导入时只分析当前包名", variable=self.log_monitor_pkg_only_var, text_color=COLOR_TEXT, font=self._font(13)).grid(row=0, column=2, sticky="w", padx=(0, 14), pady=4)
-        ctk.CTkButton(option_row, text="应用配置", width=104, height=34, corner_radius=12, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, text_color="#FFFFFF", font=self._font(13, "bold"), command=self.apply_log_analysis_config).grid(row=0, column=3, sticky="w", pady=4)
+        ctk.CTkCheckBox(option_row, text="导入时只分析当前包名", variable=self.log_monitor_pkg_only_var, text_color=COLOR_TEXT, font=self._t("body")).grid(row=0, column=2, sticky="w", padx=(0, 14), pady=4)
+        # 不再需要“应用配置”按钮：勾选、自定义关键字和上下文行数改了就自动生效（输入停 0.5 秒后）。
+        ctk.CTkLabel(option_row, text="修改后自动生效", text_color=COLOR_MUTED, font=self._t("hint")).grid(row=0, column=3, sticky="w", pady=4)
+        self.log_custom_keywords_textbox.bind("<<Modified>>", self._on_log_custom_keywords_modified, add="+")
+        if not getattr(self, "_log_context_trace_bound", False):
+            self.log_context_lines_var.trace_add("write", lambda *_: self._schedule_log_analysis_config_apply())
+            self._log_context_trace_bound = True
 
         # 操作与导入：固定两行网格，不随窗口缩小裁切。
-        action_card = ctk.CTkFrame(action_tab, fg_color=COLOR_SURFACE, corner_radius=16, border_width=1, border_color=COLOR_BORDER)
+        action_card = ctk.CTkFrame(action_tab, fg_color=COLOR_SURFACE, corner_radius=RADIUS_CARD, border_width=1, border_color=COLOR_BORDER)
         action_card.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
         action_card.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(action_card, text="操作", text_color=COLOR_TEXT, font=self._font(18, "bold")).grid(row=0, column=0, sticky="w", padx=24, pady=(20, 10))
+        ctk.CTkLabel(action_card, text="操作", text_color=COLOR_TEXT, font=self._t("card_title")).grid(row=0, column=0, sticky="w", padx=SPACE_CARD, pady=(20, 10))
         actions = ctk.CTkFrame(action_card, fg_color=COLOR_SURFACE)
-        actions.grid(row=1, column=0, sticky="ew", padx=24, pady=(0, 14))
+        actions.grid(row=1, column=0, sticky="ew", padx=SPACE_CARD, pady=(0, 14))
         for col in range(4):
             actions.grid_columnconfigure(col, weight=1, uniform="log_actions")
         for idx, (text, cmd, accent) in enumerate([
@@ -4543,34 +5280,34 @@ class XiaoXinAssistant(ctk.CTk):
             ctk.CTkButton(
                 actions,
                 text=text,
-                height=36,
-                corner_radius=12,
+                height=BUTTON_HEIGHT["sm"],
+                corner_radius=RADIUS_CONTROL,
                 fg_color=COLOR_ACCENT if accent else COLOR_SURFACE_2,
                 hover_color=COLOR_ACCENT_HOVER if accent else COLOR_HOVER,
                 border_width=0 if accent else 1,
                 border_color=COLOR_BORDER,
                 text_color="#FFFFFF" if accent else COLOR_TEXT,
-                font=self._font(13, "bold"),
+                font=self._t("label"),
                 command=cmd,
             ).grid(row=idx // 4, column=idx % 4, sticky="ew", padx=(0 if idx % 4 == 0 else 8, 0), pady=5)
-        ctk.CTkLabel(action_card, textvariable=self.log_analysis_status_var, text_color=COLOR_MUTED, wraplength=820, font=self._font(13), justify="left").grid(row=2, column=0, sticky="w", padx=24, pady=(0, 18))
+        ctk.CTkLabel(action_card, textvariable=self.log_analysis_status_var, text_color=COLOR_MUTED, wraplength=820, font=self._t("body"), justify="left").grid(row=2, column=0, sticky="w", padx=SPACE_CARD, pady=(0, 18))
 
         # 结果区：局部 Textbox 独立滚动，不再跟随整页滚动。
-        hits_card = ctk.CTkFrame(hits_tab, fg_color=COLOR_SURFACE, corner_radius=16, border_width=1, border_color=COLOR_BORDER)
+        hits_card = ctk.CTkFrame(hits_tab, fg_color=COLOR_SURFACE, corner_radius=RADIUS_CARD, border_width=1, border_color=COLOR_BORDER)
         hits_card.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
         hits_card.grid_columnconfigure(0, weight=1)
         hits_card.grid_rowconfigure(1, weight=1)
-        ctk.CTkLabel(hits_card, text="实时命中记录", text_color=COLOR_TEXT, font=self._font(18, "bold")).grid(row=0, column=0, sticky="w", padx=24, pady=(20, 10))
-        self.log_hits_box = ctk.CTkTextbox(hits_card, corner_radius=12, border_width=1, border_color=COLOR_BORDER, fg_color=COLOR_SURFACE_2, text_color=COLOR_TEXT, font=self._font(13))
-        self.log_hits_box.grid(row=1, column=0, sticky="nsew", padx=24, pady=(0, 20))
+        ctk.CTkLabel(hits_card, text="实时命中记录", text_color=COLOR_TEXT, font=self._t("card_title")).grid(row=0, column=0, sticky="w", padx=SPACE_CARD, pady=(20, 10))
+        self.log_hits_box = ctk.CTkTextbox(hits_card, corner_radius=RADIUS_CONTROL, border_width=1, border_color=COLOR_BORDER, fg_color=COLOR_SURFACE_2, text_color=COLOR_TEXT, font=self._t("body"))
+        self.log_hits_box.grid(row=1, column=0, sticky="nsew", padx=SPACE_CARD, pady=(0, 20))
 
-        crash_card = ctk.CTkFrame(crash_tab, fg_color=COLOR_SURFACE, corner_radius=16, border_width=1, border_color=COLOR_BORDER)
+        crash_card = ctk.CTkFrame(crash_tab, fg_color=COLOR_SURFACE, corner_radius=RADIUS_CARD, border_width=1, border_color=COLOR_BORDER)
         crash_card.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
         crash_card.grid_columnconfigure(0, weight=1)
         crash_card.grid_rowconfigure(1, weight=1)
-        ctk.CTkLabel(crash_card, text="崩溃提取结果", text_color=COLOR_TEXT, font=self._font(18, "bold")).grid(row=0, column=0, sticky="w", padx=24, pady=(20, 10))
-        self.crash_results_box = ctk.CTkTextbox(crash_card, corner_radius=12, border_width=1, border_color=COLOR_BORDER, fg_color=COLOR_SURFACE_2, text_color=COLOR_TEXT, font=self._font(13))
-        self.crash_results_box.grid(row=1, column=0, sticky="nsew", padx=24, pady=(0, 20))
+        ctk.CTkLabel(crash_card, text="崩溃提取结果", text_color=COLOR_TEXT, font=self._t("card_title")).grid(row=0, column=0, sticky="w", padx=SPACE_CARD, pady=(20, 10))
+        self.crash_results_box = ctk.CTkTextbox(crash_card, corner_radius=RADIUS_CONTROL, border_width=1, border_color=COLOR_BORDER, fg_color=COLOR_SURFACE_2, text_color=COLOR_TEXT, font=self._t("body"))
+        self.crash_results_box.grid(row=1, column=0, sticky="nsew", padx=SPACE_CARD, pady=(0, 20))
 
         self._refresh_log_analysis_views()
 
@@ -4580,6 +5317,34 @@ class XiaoXinAssistant(ctk.CTk):
             custom_text = self.log_custom_keywords_textbox.get("1.0", "end").strip()
             keywords.extend([line.strip() for line in custom_text.splitlines() if line.strip()])
         return keywords
+
+    def _on_log_custom_keywords_modified(self, _event=None):
+        box = getattr(self, "log_custom_keywords_textbox", None)
+        if box is None:
+            return
+        try:
+            if not box.edit_modified():
+                return
+            box.edit_modified(False)
+        except Exception:
+            return
+        self._schedule_log_analysis_config_apply()
+
+    def _schedule_log_analysis_config_apply(self):
+        job = getattr(self, "_log_config_apply_job", None)
+        if job:
+            try:
+                self.after_cancel(job)
+            except Exception:
+                pass
+        self._log_config_apply_job = self.after(500, self._run_log_analysis_config_apply)
+
+    def _run_log_analysis_config_apply(self):
+        self._log_config_apply_job = None
+        # 上下文行数正在输入（暂时为空）时不要把输入框改回 20。
+        if not self.log_context_lines_var.get().strip():
+            return
+        self.apply_log_analysis_config()
 
     def apply_log_analysis_config(self):
         try:
@@ -4601,6 +5366,7 @@ class XiaoXinAssistant(ctk.CTk):
 
     def _on_live_log_line(self, line: str):
         # 运行在 ADB 抓取线程中：只读快照属性，不访问 Tk 变量。
+        self._queue_adb_live_preview_line(line)
         if not self._log_analysis_enabled:
             return
         try:
@@ -4612,6 +5378,81 @@ class XiaoXinAssistant(ctk.CTk):
                 self._schedule_log_analysis_refresh()
         except Exception:
             pass
+
+    def _queue_adb_live_preview_line(self, line: str):
+        """Worker thread: keep the newest lines; the main thread renders them in batches."""
+        with self._adb_live_lock:
+            self._adb_live_pending.append(line.rstrip("\r\n"))
+            if self._adb_live_flush_scheduled:
+                return
+            self._adb_live_flush_scheduled = True
+        try:
+            self.after(ADB_LIVE_PREVIEW_FLUSH_MS, self._flush_adb_live_preview)
+        except Exception:
+            with self._adb_live_lock:
+                self._adb_live_flush_scheduled = False
+
+    def _flush_adb_live_preview(self):
+        # 不在日志抓取页时不渲染，待写的行保留在队列里（最多保留预览行数），切回来时再写。
+        if self.current_page != "adb_log":
+            with self._adb_live_lock:
+                self._adb_live_flush_scheduled = False
+            return
+        with self._adb_live_lock:
+            lines = list(self._adb_live_pending)
+            self._adb_live_pending.clear()
+            self._adb_live_flush_scheduled = False
+        box = getattr(self, "adb_live_preview_box", None)
+        if not lines or box is None or not box.winfo_exists():
+            return
+        if self._adb_live_preview_has_hint:
+            box.configure(state="normal")
+            box.delete("1.0", "end")
+            self._adb_live_preview_has_hint = False
+        self._append_log_box_text(box, "\n".join(lines) + "\n", max_lines=ADB_LIVE_PREVIEW_LINES)
+
+    def _load_recent_packages(self):
+        try:
+            with open(app_data_path(RECENT_PACKAGES_FILE), "r", encoding="utf-8") as fh:
+                items = json.load(fh)
+            return [str(item) for item in items if str(item).strip()][:RECENT_PACKAGES_MAX]
+        except Exception:
+            return []
+
+    def _remember_package(self, pkg):
+        pkg = (pkg or "").strip()
+        if not pkg:
+            return
+        items = [pkg] + [item for item in self._load_recent_packages() if item != pkg]
+        items = items[:RECENT_PACKAGES_MAX]
+        try:
+            with open(app_data_path(RECENT_PACKAGES_FILE), "w", encoding="utf-8") as fh:
+                json.dump(items, fh, ensure_ascii=False, indent=1)
+        except Exception:
+            pass
+        combo = getattr(self, "adb_log_pkg_combo", None)
+        if combo is not None and combo.winfo_exists():
+            combo.configure(values=items)
+
+    def adb_log_detect_foreground_package(self):
+        def worker():
+            return self.adb_tools.get_foreground_app(self.adb_tools.get_selected_serial() or None)
+        def success(info):
+            pkg = (info or {}).get("package", "")
+            if pkg:
+                self.log_pkg_var.set(pkg)
+                self._adb_log(f"已识别前台应用：{pkg}")
+            else:
+                messagebox.showinfo("识别前台应用", "没有识别到前台应用，请确认手机已解锁并打开了要测试的应用。")
+        self._run_adb_tools_task("识别前台应用", worker, success)
+
+    def _toggle_adb_log_primary(self):
+        if self.adb_log.running.is_set():
+            self.stop_all_adb_log()
+        else:
+            self.start_selected_adb_log()
+            if self.adb_log.running.is_set():
+                self._remember_package(self.log_pkg_var.get())
 
     def _schedule_log_analysis_refresh(self):
         # 多次命中合并成一次刷新，最多每 0.5 秒一次；最后一批命中也会补刷，不会被丢掉。
@@ -4762,7 +5603,7 @@ class XiaoXinAssistant(ctk.CTk):
             segmented_button_unselected_color=COLOR_SURFACE_2,
             segmented_button_unselected_hover_color=COLOR_HOVER,
             text_color=COLOR_TEXT,
-            corner_radius=12,
+            corner_radius=RADIUS_CONTROL,
         )
         tabview.grid(row=0, column=0, sticky="nsew")
 
@@ -4777,45 +5618,45 @@ class XiaoXinAssistant(ctk.CTk):
             tab.grid_rowconfigure(0, weight=1)
 
         # 设备状态：v2.4.27 多设备表格 + 当前设备详情
-        device_card = ctk.CTkFrame(device_tab, fg_color=COLOR_SURFACE, corner_radius=16, border_width=1, border_color=COLOR_BORDER)
+        device_card = ctk.CTkFrame(device_tab, fg_color=COLOR_SURFACE, corner_radius=RADIUS_CARD, border_width=1, border_color=COLOR_BORDER)
         device_card.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
         device_card.grid_columnconfigure(0, weight=1)
         device_card.grid_rowconfigure(3, weight=1)
         device_card.grid_rowconfigure(4, weight=1)
-        ctk.CTkLabel(device_card, text="设备状态", text_color=COLOR_TEXT, font=self._font(18, "bold")).grid(row=0, column=0, sticky="w", padx=24, pady=(20, 8))
+        ctk.CTkLabel(device_card, text="设备状态", text_color=COLOR_TEXT, font=self._t("card_title")).grid(row=0, column=0, sticky="w", padx=SPACE_CARD, pady=(20, 8))
         self._build_adb_device_selector(device_card, 1, show_actions=True)
 
         device_actions = ctk.CTkFrame(device_card, fg_color="transparent")
-        device_actions.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 12))
-        ctk.CTkButton(device_actions, text="读取当前设备详情", width=156, height=36, corner_radius=12, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13, "bold"), command=self.adb_tools_read_device_info).grid(row=0, column=0, padx=(0, 10), pady=4)
-        ctk.CTkButton(device_actions, text="识别前台应用", width=132, height=36, corner_radius=12, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13, "bold"), command=self.adb_tools_get_foreground).grid(row=0, column=1, padx=(0, 10), pady=4)
-        ctk.CTkLabel(device_actions, textvariable=self.adb_device_hint_var, text_color=COLOR_MUTED, wraplength=720, justify="left", font=self._font(12)).grid(row=0, column=2, sticky="w", padx=(8, 0), pady=4)
+        device_actions.grid(row=2, column=0, sticky="ew", padx=SPACE_CARD, pady=(0, 12))
+        ctk.CTkButton(device_actions, text="读取当前设备详情", width=156, height=BUTTON_HEIGHT["sm"], corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("label"), command=self.adb_tools_read_device_info).grid(row=0, column=0, padx=(0, 10), pady=4)
+        ctk.CTkButton(device_actions, text="识别前台应用", width=132, height=BUTTON_HEIGHT["sm"], corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("label"), command=self.adb_tools_get_foreground).grid(row=0, column=1, padx=(0, 10), pady=4)
+        ctk.CTkLabel(device_actions, textvariable=self.adb_device_hint_var, text_color=COLOR_MUTED, wraplength=720, justify="left", font=self._t("hint")).grid(row=0, column=2, sticky="w", padx=(8, 0), pady=4)
 
         self._build_adb_device_table(device_card, row=3)
         self._build_adb_device_detail_card(device_card, row=4)
 
         # 截图 / 录屏
-        media_card = ctk.CTkFrame(media_tab, fg_color=COLOR_SURFACE, corner_radius=16, border_width=1, border_color=COLOR_BORDER)
+        media_card = ctk.CTkFrame(media_tab, fg_color=COLOR_SURFACE, corner_radius=RADIUS_CARD, border_width=1, border_color=COLOR_BORDER)
         media_card.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
         media_card.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(media_card, text="截图 / 录屏", text_color=COLOR_TEXT, font=self._font(18, "bold")).grid(row=0, column=0, sticky="w", padx=24, pady=(20, 10))
+        ctk.CTkLabel(media_card, text="截图 / 录屏", text_color=COLOR_TEXT, font=self._t("card_title")).grid(row=0, column=0, sticky="w", padx=SPACE_CARD, pady=(20, 10))
         media_buttons = ctk.CTkFrame(media_card, fg_color=COLOR_SURFACE)
-        media_buttons.grid(row=1, column=0, sticky="w", padx=24, pady=(0, 14))
-        ctk.CTkButton(media_buttons, text="一键截图", width=112, height=36, corner_radius=12, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, text_color="#FFFFFF", font=self._font(13, "bold"), command=self.adb_tools_screenshot).grid(row=0, column=0, padx=(0, 10), pady=4)
-        ctk.CTkButton(media_buttons, text="打开截图目录", width=132, height=36, corner_radius=12, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13, "bold"), command=lambda: self._open_local_dir(self.adb_tools.screenshot_dir)).grid(row=0, column=1, padx=(0, 10), pady=4)
-        self.adb_record_button = ctk.CTkButton(media_buttons, text="开始录屏", width=112, height=36, corner_radius=12, fg_color=COLOR_DANGER if self.adb_tools.is_recording() else COLOR_ACCENT, hover_color=COLOR_DANGER_HOVER if self.adb_tools.is_recording() else COLOR_ACCENT_HOVER, text_color="#FFFFFF", font=self._font(13, "bold"), command=self.adb_tools_toggle_recording)
+        media_buttons.grid(row=1, column=0, sticky="w", padx=SPACE_CARD, pady=(0, 14))
+        ctk.CTkButton(media_buttons, text="一键截图", width=112, height=BUTTON_HEIGHT["sm"], corner_radius=RADIUS_CONTROL, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, text_color="#FFFFFF", font=self._t("label"), command=self.adb_tools_screenshot).grid(row=0, column=0, padx=(0, 10), pady=4)
+        ctk.CTkButton(media_buttons, text="打开截图目录", width=132, height=BUTTON_HEIGHT["sm"], corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("label"), command=lambda: self._open_local_dir(self.adb_tools.screenshot_dir)).grid(row=0, column=1, padx=(0, 10), pady=4)
+        self.adb_record_button = ctk.CTkButton(media_buttons, text="开始录屏", width=112, height=BUTTON_HEIGHT["sm"], corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("label"), command=self.adb_tools_toggle_recording)
         self.adb_record_button.grid(row=0, column=2, padx=(0, 10), pady=4)
-        ctk.CTkButton(media_buttons, text="打开录屏目录", width=132, height=36, corner_radius=12, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13, "bold"), command=lambda: self._open_local_dir(self.adb_tools.recording_dir)).grid(row=0, column=3, pady=4)
-        ctk.CTkLabel(media_card, textvariable=self.adb_recording_status_var, text_color=COLOR_MUTED, wraplength=760, font=self._font(13), justify="left").grid(row=2, column=0, sticky="w", padx=24, pady=(0, 18))
+        ctk.CTkButton(media_buttons, text="打开录屏目录", width=132, height=BUTTON_HEIGHT["sm"], corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("label"), command=lambda: self._open_local_dir(self.adb_tools.recording_dir)).grid(row=0, column=3, pady=4)
+        ctk.CTkLabel(media_card, textvariable=self.adb_recording_status_var, text_color=COLOR_MUTED, wraplength=760, font=self._t("body"), justify="left").grid(row=2, column=0, sticky="w", padx=SPACE_CARD, pady=(0, 18))
 
         # 应用管理
-        app_card = ctk.CTkFrame(app_tab, fg_color=COLOR_SURFACE, corner_radius=16, border_width=1, border_color=COLOR_BORDER)
+        app_card = ctk.CTkFrame(app_tab, fg_color=COLOR_SURFACE, corner_radius=RADIUS_CARD, border_width=1, border_color=COLOR_BORDER)
         app_card.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
         app_card.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(app_card, text="应用管理", text_color=COLOR_TEXT, font=self._font(18, "bold")).grid(row=0, column=0, sticky="w", padx=24, pady=(20, 4), columnspan=3)
+        ctk.CTkLabel(app_card, text="应用管理", text_color=COLOR_TEXT, font=self._t("card_title")).grid(row=0, column=0, sticky="w", padx=SPACE_CARD, pady=(20, 4), columnspan=3)
         self._entry_row(app_card, 1, "应用包名", self.adb_tools_pkg_var, "例如 com.example.game", width=520)
         app_buttons = ctk.CTkFrame(app_card, fg_color=COLOR_SURFACE)
-        app_buttons.grid(row=2, column=0, columnspan=3, sticky="ew", padx=24, pady=(0, 18))
+        app_buttons.grid(row=2, column=0, columnspan=3, sticky="ew", padx=SPACE_CARD, pady=(0, 18))
         for col in range(3):
             app_buttons.grid_columnconfigure(col, weight=1, uniform="adb_app_btns")
         for idx, (text, cmd, danger) in enumerate([
@@ -4828,46 +5669,46 @@ class XiaoXinAssistant(ctk.CTk):
             ctk.CTkButton(
                 app_buttons,
                 text=text,
-                height=38,
-                corner_radius=12,
+                height=BUTTON_HEIGHT["sm"],
+                corner_radius=RADIUS_CONTROL,
                 fg_color=COLOR_DANGER if danger else COLOR_SURFACE_2,
                 hover_color=COLOR_DANGER_HOVER if danger else COLOR_HOVER,
                 border_width=0 if danger else 1,
                 border_color=COLOR_BORDER,
                 text_color="#FFFFFF" if danger else COLOR_TEXT,
-                font=self._font(13, "bold"),
+                font=self._t("label"),
                 command=cmd,
             ).grid(row=idx // 3, column=idx % 3, sticky="ew", padx=(0 if idx % 3 == 0 else 8, 0), pady=5)
 
         # APK 信息
-        apk_card = ctk.CTkFrame(apk_tab, fg_color=COLOR_SURFACE, corner_radius=16, border_width=1, border_color=COLOR_BORDER)
+        apk_card = ctk.CTkFrame(apk_tab, fg_color=COLOR_SURFACE, corner_radius=RADIUS_CARD, border_width=1, border_color=COLOR_BORDER)
         apk_card.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
         apk_card.grid_columnconfigure(1, weight=1)
         apk_card.grid_rowconfigure(4, weight=1)
-        ctk.CTkLabel(apk_card, text="APK 信息", text_color=COLOR_TEXT, font=self._font(18, "bold")).grid(row=0, column=0, sticky="w", padx=24, pady=(20, 4), columnspan=3)
+        ctk.CTkLabel(apk_card, text="APK 信息", text_color=COLOR_TEXT, font=self._t("card_title")).grid(row=0, column=0, sticky="w", padx=SPACE_CARD, pady=(20, 4), columnspan=3)
         self._entry_row(apk_card, 1, "APK 文件", self.apk_path_var, "请选择本地 APK", width=520)
         apk_buttons = ctk.CTkFrame(apk_card, fg_color=COLOR_SURFACE)
-        apk_buttons.grid(row=2, column=0, columnspan=3, sticky="w", padx=24, pady=(0, 14))
-        ctk.CTkButton(apk_buttons, text="选择 APK", width=112, height=36, corner_radius=12, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13, "bold"), command=self.adb_tools_choose_apk).grid(row=0, column=0, padx=(0, 10))
-        ctk.CTkButton(apk_buttons, text="解析 APK 信息", width=132, height=36, corner_radius=12, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, text_color="#FFFFFF", font=self._font(13, "bold"), command=self.adb_tools_analyze_apk).grid(row=0, column=1, padx=(0, 10))
-        ctk.CTkButton(apk_buttons, text="安装 APK", width=112, height=36, corner_radius=12, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13, "bold"), command=self.adb_tools_install_apk).grid(row=0, column=2)
-        ctk.CTkLabel(apk_card, textvariable=self.apk_status_var, text_color=COLOR_MUTED, wraplength=760, font=self._font(13)).grid(row=3, column=0, columnspan=3, sticky="w", padx=24, pady=(0, 8))
-        self.apk_info_box = ctk.CTkTextbox(apk_card, corner_radius=12, border_width=1, border_color=COLOR_BORDER, fg_color=COLOR_SURFACE_2, text_color=COLOR_TEXT, font=self._font(13))
-        self.apk_info_box.grid(row=4, column=0, columnspan=3, sticky="nsew", padx=24, pady=(0, 20))
+        apk_buttons.grid(row=2, column=0, columnspan=3, sticky="w", padx=SPACE_CARD, pady=(0, 14))
+        ctk.CTkButton(apk_buttons, text="选择 APK", width=112, height=BUTTON_HEIGHT["sm"], corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("label"), command=self.adb_tools_choose_apk).grid(row=0, column=0, padx=(0, 10))
+        ctk.CTkButton(apk_buttons, text="解析 APK 信息", width=132, height=BUTTON_HEIGHT["sm"], corner_radius=RADIUS_CONTROL, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, text_color="#FFFFFF", font=self._t("label"), command=self.adb_tools_analyze_apk).grid(row=0, column=1, padx=(0, 10))
+        ctk.CTkButton(apk_buttons, text="安装 APK", width=112, height=BUTTON_HEIGHT["sm"], corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("label"), command=self.adb_tools_install_apk).grid(row=0, column=2)
+        ctk.CTkLabel(apk_card, textvariable=self.apk_status_var, text_color=COLOR_MUTED, wraplength=760, font=self._t("body")).grid(row=3, column=0, columnspan=3, sticky="w", padx=SPACE_CARD, pady=(0, 8))
+        self.apk_info_box = ctk.CTkTextbox(apk_card, corner_radius=RADIUS_CONTROL, border_width=1, border_color=COLOR_BORDER, fg_color=COLOR_SURFACE_2, text_color=COLOR_TEXT, font=self._t("body"))
+        self.apk_info_box.grid(row=4, column=0, columnspan=3, sticky="nsew", padx=SPACE_CARD, pady=(0, 20))
         self._set_textbox_text(self.apk_info_box, "请选择 APK 后点击解析。")
 
         # 操作日志
-        log_card = ctk.CTkFrame(log_tab, fg_color=COLOR_SURFACE, corner_radius=16, border_width=1, border_color=COLOR_BORDER)
+        log_card = ctk.CTkFrame(log_tab, fg_color=COLOR_SURFACE, corner_radius=RADIUS_CARD, border_width=1, border_color=COLOR_BORDER)
         log_card.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
         log_card.grid_columnconfigure(0, weight=1)
         log_card.grid_rowconfigure(2, weight=1)
-        ctk.CTkLabel(log_card, text="操作日志", text_color=COLOR_TEXT, font=self._font(18, "bold")).grid(row=0, column=0, sticky="w", padx=24, pady=(20, 10))
+        ctk.CTkLabel(log_card, text="操作日志", text_color=COLOR_TEXT, font=self._t("card_title")).grid(row=0, column=0, sticky="w", padx=SPACE_CARD, pady=(20, 10))
         log_buttons = ctk.CTkFrame(log_card, fg_color=COLOR_SURFACE)
-        log_buttons.grid(row=1, column=0, sticky="w", padx=24, pady=(0, 10))
-        ctk.CTkButton(log_buttons, text="复制日志", width=112, height=34, corner_radius=12, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13, "bold"), command=self.adb_tools_copy_log).grid(row=0, column=0, padx=(0, 10))
-        ctk.CTkButton(log_buttons, text="清空日志", width=112, height=34, corner_radius=12, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13, "bold"), command=self.adb_tools_clear_log).grid(row=0, column=1)
-        self.adb_tools_log_box = ctk.CTkTextbox(log_card, corner_radius=12, border_width=1, border_color=COLOR_BORDER, fg_color=COLOR_SURFACE_2, text_color=COLOR_TEXT, font=self._font(13))
-        self.adb_tools_log_box.grid(row=2, column=0, sticky="nsew", padx=24, pady=(0, 20))
+        log_buttons.grid(row=1, column=0, sticky="w", padx=SPACE_CARD, pady=(0, 10))
+        ctk.CTkButton(log_buttons, text="复制日志", width=112, height=BUTTON_HEIGHT["sm"], corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("label"), command=self.adb_tools_copy_log).grid(row=0, column=0, padx=(0, 10))
+        ctk.CTkButton(log_buttons, text="清空日志", width=112, height=BUTTON_HEIGHT["sm"], corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("label"), command=self.adb_tools_clear_log).grid(row=0, column=1)
+        self.adb_tools_log_box = ctk.CTkTextbox(log_card, corner_radius=RADIUS_CONTROL, border_width=1, border_color=COLOR_BORDER, fg_color=COLOR_SURFACE_2, text_color=COLOR_TEXT, font=self._t("body"))
+        self.adb_tools_log_box.grid(row=2, column=0, sticky="nsew", padx=SPACE_CARD, pady=(0, 20))
         self.adb_tools_log_box.insert("end", "ADB 工具已就绪。所有操作均在本地执行，不上传文件。\n")
         self.adb_tools_log_box.configure(state="disabled")
         self._refresh_adb_tools_buttons()
@@ -4884,7 +5725,7 @@ class XiaoXinAssistant(ctk.CTk):
         except Exception:
             pass
         toolbar = ctk.CTkFrame(parent, fg_color="transparent")
-        toolbar.grid(row=row, column=0, columnspan=3, sticky="ew", padx=24, pady=(4, 12))
+        toolbar.grid(row=row, column=0, columnspan=3, sticky="ew", padx=SPACE_CARD, pady=(4, 12))
         toolbar.grid_columnconfigure(0, weight=0)
         toolbar.grid_columnconfigure(1, weight=1)
         toolbar.grid_columnconfigure(2, weight=0)
@@ -4895,8 +5736,8 @@ class XiaoXinAssistant(ctk.CTk):
             action_line.grid_columnconfigure(0, weight=0)
             action_line.grid_columnconfigure(1, weight=0)
             action_line.grid_columnconfigure(2, weight=1)
-            ctk.CTkButton(action_line, text="刷新设备", width=96, height=36, corner_radius=12, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, text_color="#FFFFFF", font=self._font(13, "bold"), command=self.adb_tools_check_devices).grid(row=0, column=0, padx=(0, 8), pady=4, sticky="w")
-            ctk.CTkButton(action_line, text="重启 ADB", width=96, height=36, corner_radius=12, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13, "bold"), command=self.restart_adb_server).grid(row=0, column=1, padx=(0, 8), pady=4, sticky="w")
+            ctk.CTkButton(action_line, text="刷新设备", width=96, height=BUTTON_HEIGHT["sm"], corner_radius=RADIUS_CONTROL, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, text_color="#FFFFFF", font=self._t("label"), command=self.adb_tools_check_devices).grid(row=0, column=0, padx=(0, 8), pady=4, sticky="w")
+            ctk.CTkButton(action_line, text="重启 ADB", width=96, height=BUTTON_HEIGHT["sm"], corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("label"), command=self.restart_adb_server).grid(row=0, column=1, padx=(0, 8), pady=4, sticky="w")
             selector_row = 1
         else:
             selector_row = 0
@@ -4905,7 +5746,7 @@ class XiaoXinAssistant(ctk.CTk):
             toolbar,
             text="当前设备",
             text_color=COLOR_TEXT,
-            font=self._font(14, "bold"),
+            font=self._t("label"),
         ).grid(row=selector_row, column=0, sticky="w", padx=(0, 10), pady=4)
         values = self.adb_device_choice_values or ["未选择设备"]
         menu = ctk.CTkOptionMenu(
@@ -4922,8 +5763,8 @@ class XiaoXinAssistant(ctk.CTk):
             dropdown_hover_color=COLOR_HOVER,
             dropdown_text_color=COLOR_TEXT,
             text_color=COLOR_TEXT,
-            font=self._font(13),
-            dropdown_font=self._font(13),
+            font=self._t("body"),
+            dropdown_font=self._t("body"),
             command=self._on_adb_device_selected,
         )
         menu.grid(row=selector_row, column=1, sticky="ew", padx=(0, 10), pady=4)
@@ -4977,8 +5818,8 @@ class XiaoXinAssistant(ctk.CTk):
                 pass
 
     def _build_adb_device_table(self, parent, row):
-        table_frame = ctk.CTkFrame(parent, fg_color=COLOR_SURFACE_2, corner_radius=12, border_width=1, border_color=COLOR_BORDER)
-        table_frame.grid(row=row, column=0, sticky="nsew", padx=24, pady=(0, 12))
+        table_frame = ctk.CTkFrame(parent, fg_color=COLOR_SURFACE_2, corner_radius=RADIUS_CONTROL, border_width=1, border_color=COLOR_BORDER)
+        table_frame.grid(row=row, column=0, sticky="nsew", padx=SPACE_CARD, pady=(0, 12))
         table_frame.grid_columnconfigure(0, weight=1)
         table_frame.grid_rowconfigure(0, weight=1)
         columns = ("current", "serial", "model", "brand", "android", "sdk", "resolution", "status", "connection", "foreground")
@@ -5010,12 +5851,12 @@ class XiaoXinAssistant(ctk.CTk):
         self.adb_device_table = tree
 
     def _build_adb_device_detail_card(self, parent, row):
-        detail = ctk.CTkFrame(parent, fg_color=COLOR_SURFACE_2, corner_radius=12, border_width=1, border_color=COLOR_BORDER)
-        detail.grid(row=row, column=0, sticky="nsew", padx=24, pady=(0, 20))
+        detail = ctk.CTkFrame(parent, fg_color=COLOR_SURFACE_2, corner_radius=RADIUS_CONTROL, border_width=1, border_color=COLOR_BORDER)
+        detail.grid(row=row, column=0, sticky="nsew", padx=SPACE_CARD, pady=(0, 20))
         detail.grid_columnconfigure(0, weight=1)
         detail.grid_rowconfigure(1, weight=1)
-        ctk.CTkLabel(detail, text="当前设备详情", text_color=COLOR_TEXT, font=self._font(15, "bold")).grid(row=0, column=0, sticky="w", padx=16, pady=(12, 6))
-        self.adb_device_detail_box = ctk.CTkTextbox(detail, height=150, corner_radius=10, border_width=0, fg_color=COLOR_SURFACE_2, text_color=COLOR_TEXT, font=self._font(13))
+        ctk.CTkLabel(detail, text="当前设备详情", text_color=COLOR_TEXT, font=self._t("label")).grid(row=0, column=0, sticky="w", padx=16, pady=(12, 6))
+        self.adb_device_detail_box = ctk.CTkTextbox(detail, height=150, corner_radius=10, border_width=0, fg_color=COLOR_SURFACE_2, text_color=COLOR_TEXT, font=self._t("body"))
         self.adb_device_detail_box.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 12))
         self._set_textbox_text(self.adb_device_detail_box, "未检测到 Android 设备，请连接设备并开启 USB 调试，然后点击刷新设备。")
 
@@ -5111,7 +5952,13 @@ class XiaoXinAssistant(ctk.CTk):
         serial = data.get("selected_serial") or self.adb_tools.get_selected_serial()
         item = self._device_by_serial(serial, data) if serial else None
         if hasattr(self, "adb_device_detail_box") and self.adb_device_detail_box.winfo_exists():
-            self._set_textbox_text(self.adb_device_detail_box, self._format_device_detail(item))
+            devices = data.get("devices", []) or []
+            if item is None and devices:
+                # 识别到了设备但还没选中（多台设备时不会自动选），提示去选，而不是说“未检测到设备”。
+                text = f"已识别 {len(devices)} 台设备，请在上方“当前设备”中选择，或在表格中点击一台设备。"
+            else:
+                text = self._format_device_detail(item)
+            self._set_textbox_text(self.adb_device_detail_box, text)
 
     def _on_adb_device_table_select(self, event=None):
         # v2.4.28: 只响应用户点击，不响应刷新表格过程中的程序化选中。
@@ -5258,7 +6105,11 @@ class XiaoXinAssistant(ctk.CTk):
         except Exception:
             pass
 
-    def _run_adb_tools_task(self, title, worker, on_success=None):
+    def _run_adb_tools_task(self, title, worker, on_success=None, silent=False):
+        """Run an ADB command in a worker thread. silent=True: no error dialog, used for automatic detection."""
+        if silent:
+            self._run_adb_tools_task_silently(title, worker, on_success)
+            return
         if self.adb_tools_busy.is_set():
             self._adb_tools_log("已有 ADB 操作正在执行，请稍后再试")
             return
@@ -5296,14 +6147,45 @@ class XiaoXinAssistant(ctk.CTk):
                     self.adb_tools_busy.clear()
         threading.Thread(target=run, daemon=True).start()
 
+    def _run_adb_tools_task_silently(self, title, worker, on_success=None):
+        """Background ADB work the user did not ask for (auto device scan).
+
+        Does not take adb_tools_busy and does not change the task phase, so the page badge does not
+        show “运行中” and the user's own clicks are never blocked. Errors only go to the log and hint.
+        """
+        def run():
+            try:
+                result = worker()
+                def ok():
+                    if on_success:
+                        on_success(result)
+                    self._adb_tools_log(f"完成：{title}")
+            except Exception as exc:
+                def ok(exc=exc):
+                    self._adb_tools_log(f"失败：{title}｜{exc}")
+                    try:
+                        self.adb_device_hint_var.set(f"自动检测设备失败：{exc}，可点击“刷新设备”重试")
+                    except Exception:
+                        pass
+            try:
+                self.after(0, ok)
+            except Exception:
+                pass
+        threading.Thread(target=run, daemon=True).start()
+
     def _refresh_adb_tools_buttons(self):
-        if hasattr(self, "adb_record_button") and self.adb_record_button.winfo_exists():
+        # “一键截图”是这一块的主操作；录屏平时用次要样式，录屏中变成红色“停止录屏”。
+        # 状态栏每 0.5 秒调用一次，状态没变时不重画。
+        button = getattr(self, "adb_record_button", None)
+        if button is not None and button.winfo_exists():
             recording = self.adb_tools.is_recording()
-            self.adb_record_button.configure(
-                text="停止录屏" if recording else "开始录屏",
-                fg_color=COLOR_DANGER if recording else COLOR_ACCENT,
-                hover_color=COLOR_DANGER_HOVER if recording else COLOR_ACCENT_HOVER,
-            )
+            state = (button, recording)
+            if state != getattr(self, "_adb_record_button_state", None):
+                self._adb_record_button_state = state
+                if recording:
+                    button.configure(text="停止录屏", fg_color=COLOR_DANGER, hover_color=COLOR_DANGER_HOVER, text_color="#FFFFFF", border_width=0)
+                else:
+                    button.configure(text="开始录屏", fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, text_color=COLOR_TEXT, border_width=1)
         if self.adb_tools.is_recording():
             self.adb_recording_status_var.set("录屏中")
 
@@ -5324,7 +6206,7 @@ class XiaoXinAssistant(ctk.CTk):
                 self._set_textbox_text(self.adb_tools_devices_box, text)
         self._run_adb_tools_task("重启 ADB 服务", worker, success)
 
-    def adb_tools_check_devices(self):
+    def adb_tools_check_devices(self, silent=False):
         def worker():
             generation = self._begin_adb_refresh()
             return self._scan_adb_devices_staged(generation, refresh_resolutions=True)
@@ -5334,7 +6216,18 @@ class XiaoXinAssistant(ctk.CTk):
             self.adb_tools_devices_var.set(text)
             if hasattr(self, "adb_tools_devices_box") and self.adb_tools_devices_box.winfo_exists():
                 self._set_textbox_text(self.adb_tools_devices_box, text)
-        self._run_adb_tools_task("检测设备", worker, success)
+        self._run_adb_tools_task("自动检测设备" if silent else "检测设备", worker, success, silent=silent)
+
+    def _auto_detect_adb_devices_once(self):
+        """First visit to an ADB page: scan devices in the background (one device is auto-selected)."""
+        if getattr(self, "_adb_auto_detect_done", False) or self.is_exiting:
+            return
+        self._adb_auto_detect_done = True
+        try:
+            self.adb_device_hint_var.set("正在自动检测设备…")
+        except Exception:
+            pass
+        self.adb_tools_check_devices(silent=True)
 
     def adb_tools_read_device_info(self):
         def worker():
@@ -5554,59 +6447,68 @@ class XiaoXinAssistant(ctk.CTk):
         setup_wrap.grid_rowconfigure(0, weight=0)
         setup_wrap.grid_rowconfigure(1, weight=1)
 
-        tool_card = ctk.CTkFrame(setup_wrap, fg_color=COLOR_SURFACE, corner_radius=16, border_width=1, border_color=COLOR_BORDER)
+        # 工具区默认只显示一行状态；大多数人用安装包内置工具，路径配置收进“自定义路径”。
+        tool_card = ctk.CTkFrame(setup_wrap, fg_color=COLOR_SURFACE, corner_radius=RADIUS_CARD, border_width=1, border_color=COLOR_BORDER)
         tool_card.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 14))
-        tool_card.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(tool_card, text="iOS 工具路径配置", text_color=COLOR_TEXT, font=self._font(18, "bold")).grid(row=0, column=0, sticky="w", padx=24, pady=(18, 8), columnspan=3)
-        ctk.CTkLabel(
-            tool_card,
-            text="依赖 libimobiledevice。安装包已内置到程序目录 tools/ios，也可手动选择其他路径。",
-            text_color=COLOR_MUTED,
-            font=self._font(13),
-            wraplength=760,
-            anchor="w",
-        ).grid(row=1, column=0, columnspan=3, sticky="ew", padx=24, pady=(0, 8))
+        tool_card.grid_columnconfigure(0, weight=1)
+        tool_head = ctk.CTkFrame(tool_card, fg_color="transparent")
+        tool_head.grid(row=0, column=0, sticky="ew", padx=SPACE_CARD, pady=(16, 14))
+        tool_head.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(tool_head, text="iOS 工具", text_color=COLOR_TEXT, font=self._t("card_title")).grid(row=0, column=0, sticky="w", padx=(0, 16))
+        self.ios_tool_summary_label = ctk.CTkLabel(tool_head, textvariable=self.ios_tool_summary_var, text_color=COLOR_MUTED, font=self._t("body"), anchor="w")
+        self.ios_tool_summary_label.grid(row=0, column=1, sticky="ew")
+        head_buttons = ctk.CTkFrame(tool_head, fg_color="transparent")
+        head_buttons.grid(row=0, column=2, sticky="e")
+        ctk.CTkButton(head_buttons, text="重新检测", width=92, height=32, corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("label"), command=self.ios_detect_tools).pack(side="left", padx=(0, 8))
+        self.ios_custom_paths_button = ctk.CTkButton(head_buttons, text="自定义路径 ▾", width=112, height=32, corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("label"), command=self._toggle_ios_custom_paths)
+        self.ios_custom_paths_button.pack(side="left", padx=(0, 8))
+        ctk.CTkButton(head_buttons, text="打开工具目录", width=112, height=32, corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("label"), command=self.ios_open_tools_dir).pack(side="left")
 
-        row = 2
+        paths = ctk.CTkFrame(tool_card, fg_color="transparent")
+        paths.grid(row=1, column=0, sticky="ew", padx=SPACE_CARD, pady=(0, 16))
+        paths.grid_columnconfigure(1, weight=1)
+        self.ios_custom_paths_frame = paths
+        ctk.CTkLabel(
+            paths,
+            text="留空则自动使用安装包内置的 tools/ios；只有想换用其他版本的 libimobiledevice 时才需要填写。",
+            text_color=COLOR_MUTED,
+            font=self._t("hint"),
+            anchor="w",
+        ).grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+        row = 1
         for tool_name, label in [
             ("idevice_id.exe", "idevice_id.exe"),
             ("ideviceinfo.exe", "ideviceinfo.exe"),
             ("idevicesyslog.exe", "idevicesyslog.exe"),
             ("idevicecrashreport.exe", "idevicecrashreport.exe（可选）"),
         ]:
-            ctk.CTkLabel(tool_card, text=label, text_color=COLOR_TEXT, font=self._font(14, "bold")).grid(row=row, column=0, sticky="w", padx=(24, 16), pady=5)
-            ctk.CTkEntry(tool_card, textvariable=self.ios_tool_path_vars[tool_name], height=34, corner_radius=10, fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER, text_color=COLOR_TEXT).grid(row=row, column=1, sticky="ew", pady=5)
-            ctk.CTkButton(tool_card, text="选择", width=76, height=32, corner_radius=12, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13, "bold"), command=lambda n=tool_name: self.ios_choose_tool_path(n)).grid(row=row, column=2, padx=(10, 24), pady=5)
+            ctk.CTkLabel(paths, text=label, text_color=COLOR_TEXT, font=self._t("label")).grid(row=row, column=0, sticky="w", padx=(0, 16), pady=4)
+            ctk.CTkEntry(paths, textvariable=self.ios_tool_path_vars[tool_name], height=32, corner_radius=10, fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER, text_color=COLOR_TEXT, placeholder_text="留空 = 使用内置工具").grid(row=row, column=1, sticky="ew", pady=4)
+            ctk.CTkButton(paths, text="选择", width=72, height=30, corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("label"), command=lambda n=tool_name: self.ios_choose_tool_path(n)).grid(row=row, column=2, padx=(10, 0), pady=4)
             row += 1
-
-        tool_buttons = ctk.CTkFrame(tool_card, fg_color=COLOR_SURFACE)
-        tool_buttons.grid(row=row, column=0, columnspan=3, sticky="ew", padx=24, pady=(8, 14))
-        tool_buttons.grid_columnconfigure((0, 1, 2), weight=0)
-        ctk.CTkButton(tool_buttons, text="检测工具", width=112, height=34, corner_radius=12, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, text_color="#FFFFFF", font=self._font(13, "bold"), command=self.ios_detect_tools).grid(row=0, column=0, padx=(0, 10), pady=0)
-        ctk.CTkButton(tool_buttons, text="保存路径配置", width=128, height=34, corner_radius=12, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13, "bold"), command=self.ios_save_tool_paths).grid(row=0, column=1, padx=(0, 10), pady=0)
-        ctk.CTkButton(tool_buttons, text="打开 iOS 工具目录", width=152, height=34, corner_radius=12, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13, "bold"), command=self.ios_open_tools_dir).grid(row=0, column=2, pady=0)
-
-        result_card = ctk.CTkFrame(setup_wrap, fg_color=COLOR_SURFACE, corner_radius=16, border_width=1, border_color=COLOR_BORDER)
-        result_card.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(0, 0))
-        result_card.grid_columnconfigure(0, weight=1)
-        result_card.grid_rowconfigure(1, weight=1)
-        ctk.CTkLabel(result_card, text="iOS 工具检测结果", text_color=COLOR_TEXT, font=self._font(17, "bold")).grid(row=0, column=0, sticky="w", padx=20, pady=(18, 8))
-        self.ios_tool_result_box = ctk.CTkTextbox(result_card, height=210, corner_radius=12, border_width=1, border_color=COLOR_BORDER, fg_color=COLOR_SURFACE_2, text_color=COLOR_TEXT, font=self._font(13))
-        self.ios_tool_result_box.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 18))
+        path_buttons = ctk.CTkFrame(paths, fg_color="transparent")
+        path_buttons.grid(row=row, column=0, columnspan=3, sticky="w", pady=(6, 6))
+        ctk.CTkButton(path_buttons, text="保存并检测", width=112, height=32, corner_radius=RADIUS_CONTROL, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, text_color="#FFFFFF", font=self._t("label"), command=self._ios_save_and_detect_tools).pack(side="left")
+        row += 1
+        self.ios_tool_result_box = ctk.CTkTextbox(paths, height=110, corner_radius=RADIUS_CONTROL, border_width=1, border_color=COLOR_BORDER, fg_color=COLOR_SURFACE_2, text_color=COLOR_TEXT, font=self._t("hint"))
+        self.ios_tool_result_box.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(4, 0))
         self._set_textbox_text(self.ios_tool_result_box, self.ios_tool_status_var.get())
+        self.ios_custom_paths_visible = True
+        if not any(var.get().strip() for var in self.ios_tool_path_vars.values()):
+            self._toggle_ios_custom_paths()  # 没有自定义路径时默认收起
 
-        device_card = ctk.CTkFrame(setup_wrap, fg_color=COLOR_SURFACE, corner_radius=16, border_width=1, border_color=COLOR_BORDER)
-        device_card.grid(row=1, column=1, sticky="nsew", padx=(8, 0), pady=(0, 0))
+        device_card = ctk.CTkFrame(setup_wrap, fg_color=COLOR_SURFACE, corner_radius=RADIUS_CARD, border_width=1, border_color=COLOR_BORDER)
+        device_card.grid(row=1, column=0, columnspan=2, sticky="nsew")
         device_card.grid_columnconfigure(0, weight=1)
         device_card.grid_rowconfigure(2, weight=1)
-        ctk.CTkLabel(device_card, text="设备检测", text_color=COLOR_TEXT, font=self._font(17, "bold")).grid(row=0, column=0, sticky="w", padx=20, pady=(18, 8))
+        ctk.CTkLabel(device_card, text="设备检测", text_color=COLOR_TEXT, font=self._t("card_title")).grid(row=0, column=0, sticky="w", padx=20, pady=(18, 8))
         device_row = ctk.CTkFrame(device_card, fg_color=COLOR_SURFACE)
         device_row.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 10))
         device_row.grid_columnconfigure(2, weight=1)
-        ctk.CTkButton(device_row, text="检测 iOS 设备", width=132, height=34, corner_radius=12, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, text_color="#FFFFFF", font=self._font(13, "bold"), command=self.ios_detect_devices).grid(row=0, column=0, padx=(0, 12))
-        ctk.CTkLabel(device_row, text="UDID", text_color=COLOR_TEXT, font=self._font(13, "bold")).grid(row=0, column=1, padx=(0, 8))
+        ctk.CTkButton(device_row, text="检测 iOS 设备", width=132, height=BUTTON_HEIGHT["sm"], corner_radius=RADIUS_CONTROL, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, text_color="#FFFFFF", font=self._t("label"), command=self.ios_detect_devices).grid(row=0, column=0, padx=(0, 12))
+        ctk.CTkLabel(device_row, text="UDID", text_color=COLOR_TEXT, font=self._t("label")).grid(row=0, column=1, padx=(0, 8))
         ctk.CTkEntry(device_row, textvariable=self.ios_selected_udid_var, height=34, corner_radius=10, fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER, text_color=COLOR_TEXT, placeholder_text="留空则使用默认连接设备").grid(row=0, column=2, sticky="ew")
-        self.ios_devices_box = ctk.CTkTextbox(device_card, height=210, corner_radius=12, border_width=1, border_color=COLOR_BORDER, fg_color=COLOR_SURFACE_2, text_color=COLOR_TEXT, font=self._font(13))
+        self.ios_devices_box = ctk.CTkTextbox(device_card, height=210, corner_radius=RADIUS_CONTROL, border_width=1, border_color=COLOR_BORDER, fg_color=COLOR_SURFACE_2, text_color=COLOR_TEXT, font=self._t("body"))
         self.ios_devices_box.grid(row=2, column=0, sticky="nsew", padx=20, pady=(0, 18))
         self._set_textbox_text(self.ios_devices_box, self.ios_devices_var.get())
 
@@ -5616,45 +6518,76 @@ class XiaoXinAssistant(ctk.CTk):
         log_wrap.grid_columnconfigure(0, weight=1)
         log_wrap.grid_rowconfigure(1, weight=1)
 
-        filter_card = ctk.CTkFrame(log_wrap, fg_color=COLOR_SURFACE, corner_radius=16, border_width=1, border_color=COLOR_BORDER)
+        filter_card = ctk.CTkFrame(log_wrap, fg_color=COLOR_SURFACE, corner_radius=RADIUS_CARD, border_width=1, border_color=COLOR_BORDER)
         filter_card.grid(row=0, column=0, sticky="ew", pady=(0, 14))
         filter_card.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(filter_card, text="日志过滤", text_color=COLOR_TEXT, font=self._font(18, "bold")).grid(row=0, column=0, sticky="w", padx=24, pady=(18, 8), columnspan=3)
+        ctk.CTkLabel(filter_card, text="日志过滤", text_color=COLOR_TEXT, font=self._t("card_title")).grid(row=0, column=0, sticky="w", padx=SPACE_CARD, pady=(18, 8), columnspan=3)
         keyword_frame = ctk.CTkFrame(filter_card, fg_color=COLOR_SURFACE)
-        keyword_frame.grid(row=1, column=0, columnspan=3, sticky="ew", padx=24, pady=(0, 8))
+        keyword_frame.grid(row=1, column=0, columnspan=3, sticky="ew", padx=SPACE_CARD, pady=(0, 8))
         for col in range(4):
             keyword_frame.grid_columnconfigure(col, minsize=150)
         for idx, keyword in enumerate(DEFAULT_IOS_KEYWORDS):
-            ctk.CTkCheckBox(keyword_frame, text=keyword, variable=self.ios_keyword_vars[keyword], width=150, text_color=COLOR_TEXT, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, font=self._font(13)).grid(row=idx // 4, column=idx % 4, sticky="w", padx=(0, 10), pady=3)
+            ctk.CTkCheckBox(keyword_frame, text=keyword, variable=self.ios_keyword_vars[keyword], width=150, text_color=COLOR_TEXT, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, font=self._t("body")).grid(row=idx // 4, column=idx % 4, sticky="w", padx=(0, 10), pady=3)
 
-        ctk.CTkLabel(filter_card, text="自定义关键字（每行一个）", text_color=COLOR_TEXT, font=self._font(14, "bold")).grid(row=2, column=0, sticky="nw", padx=(24, 18), pady=(6, 8))
-        self.ios_custom_keywords_textbox = ctk.CTkTextbox(filter_card, height=60, corner_radius=12, border_width=1, border_color=COLOR_BORDER, fg_color=COLOR_SURFACE_2, text_color=COLOR_TEXT, font=self._font(13))
-        self.ios_custom_keywords_textbox.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(0, 24), pady=(6, 8))
-        ctk.CTkLabel(filter_card, text="App / Bundle ID / 进程名过滤", text_color=COLOR_TEXT, font=self._font(14, "bold")).grid(row=3, column=0, sticky="w", padx=(24, 18), pady=(0, 14))
+        ctk.CTkLabel(filter_card, text="自定义关键字（每行一个）", text_color=COLOR_TEXT, font=self._t("label")).grid(row=2, column=0, sticky="nw", padx=(SPACE_CARD, 18), pady=(6, 8))
+        self.ios_custom_keywords_textbox = ctk.CTkTextbox(filter_card, height=60, corner_radius=RADIUS_CONTROL, border_width=1, border_color=COLOR_BORDER, fg_color=COLOR_SURFACE_2, text_color=COLOR_TEXT, font=self._t("body"))
+        self.ios_custom_keywords_textbox.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(0, SPACE_CARD), pady=(6, 8))
+        ctk.CTkLabel(filter_card, text="App / Bundle ID / 进程名过滤", text_color=COLOR_TEXT, font=self._t("label")).grid(row=3, column=0, sticky="w", padx=(SPACE_CARD, 18), pady=(0, 14))
         ctk.CTkEntry(filter_card, textvariable=self.ios_filter_text_var, height=34, corner_radius=10, fg_color=COLOR_SURFACE_2, border_color=COLOR_BORDER, text_color=COLOR_TEXT, placeholder_text="例如 com.company.game / Unity / 进程名").grid(row=3, column=1, sticky="ew", pady=(0, 14))
-        ctk.CTkCheckBox(filter_card, text="只显示命中日志", variable=self.ios_only_hits_var, text_color=COLOR_TEXT, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, font=self._font(13)).grid(row=3, column=2, sticky="w", padx=(12, 24), pady=(0, 14))
+        ctk.CTkCheckBox(filter_card, text="只显示命中日志", variable=self.ios_only_hits_var, text_color=COLOR_TEXT, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, font=self._t("body")).grid(row=3, column=2, sticky="w", padx=(12, SPACE_CARD), pady=(0, 14))
 
-        log_card = ctk.CTkFrame(log_wrap, fg_color=COLOR_SURFACE, corner_radius=16, border_width=1, border_color=COLOR_BORDER)
+        log_card = ctk.CTkFrame(log_wrap, fg_color=COLOR_SURFACE, corner_radius=RADIUS_CARD, border_width=1, border_color=COLOR_BORDER)
         log_card.grid(row=1, column=0, sticky="nsew")
         log_card.grid_columnconfigure(0, weight=1)
         log_card.grid_rowconfigure(4, weight=1)
-        ctk.CTkLabel(log_card, text="实时日志", text_color=COLOR_TEXT, font=self._font(18, "bold")).grid(row=0, column=0, sticky="w", padx=24, pady=(18, 8), columnspan=3)
+        ctk.CTkLabel(log_card, text="实时日志", text_color=COLOR_TEXT, font=self._t("card_title")).grid(row=0, column=0, sticky="w", padx=SPACE_CARD, pady=(18, 8), columnspan=3)
         action_row = ctk.CTkFrame(log_card, fg_color=COLOR_SURFACE)
-        action_row.grid(row=1, column=0, columnspan=3, sticky="ew", padx=24, pady=(0, 8))
+        action_row.grid(row=1, column=0, columnspan=3, sticky="ew", padx=SPACE_CARD, pady=(0, 8))
         for col in range(4):
             action_row.grid_columnconfigure(col, weight=0)
-        self.ios_log_button = ctk.CTkButton(action_row, text="▶  开始抓取 iOS 日志", width=180, height=36, corner_radius=12, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, text_color="#FFFFFF", font=self._font(13, "bold"), command=self.ios_toggle_log)
+        self.ios_log_button = ctk.CTkButton(action_row, text="▶  开始抓取 iOS 日志", width=180, height=BUTTON_HEIGHT["sm"], corner_radius=RADIUS_CONTROL, fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, text_color="#FFFFFF", font=self._t("label"), command=self.ios_toggle_log)
         self.ios_log_button.grid(row=0, column=0, padx=(0, 10), pady=0)
-        ctk.CTkButton(action_row, text="复制当前日志", width=120, height=36, corner_radius=12, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13, "bold"), command=self.ios_copy_current_log).grid(row=0, column=1, padx=(0, 10), pady=0)
-        ctk.CTkButton(action_row, text="清空显示", width=104, height=36, corner_radius=12, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13, "bold"), command=self.ios_clear_display).grid(row=0, column=2, padx=(0, 10), pady=0)
-        ctk.CTkButton(action_row, text="导入到日志分析", width=140, height=36, corner_radius=12, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._font(13, "bold"), command=self.ios_import_saved_log_to_analysis).grid(row=0, column=3, pady=0)
-        ctk.CTkLabel(log_card, textvariable=self.ios_status_var, text_color=COLOR_MUTED, font=self._font(13)).grid(row=2, column=0, sticky="w", padx=24, pady=(0, 4))
-        ctk.CTkLabel(log_card, textvariable=self.ios_log_file_var, text_color=COLOR_MUTED, wraplength=760, font=self._font(13)).grid(row=3, column=0, sticky="w", padx=24, pady=(0, 8))
-        self.ios_log_box = ctk.CTkTextbox(log_card, height=260, corner_radius=12, border_width=1, border_color=COLOR_BORDER, fg_color=COLOR_SURFACE_2, text_color=COLOR_TEXT, font=self._font(13))
-        self.ios_log_box.grid(row=4, column=0, columnspan=3, sticky="nsew", padx=24, pady=(0, 18))
+        ctk.CTkButton(action_row, text="复制当前日志", width=120, height=BUTTON_HEIGHT["sm"], corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("label"), command=self.ios_copy_current_log).grid(row=0, column=1, padx=(0, 10), pady=0)
+        ctk.CTkButton(action_row, text="清空显示", width=104, height=BUTTON_HEIGHT["sm"], corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("label"), command=self.ios_clear_display).grid(row=0, column=2, padx=(0, 10), pady=0)
+        ctk.CTkButton(action_row, text="导入到日志分析", width=140, height=BUTTON_HEIGHT["sm"], corner_radius=RADIUS_CONTROL, fg_color=COLOR_SURFACE_2, hover_color=COLOR_HOVER, border_width=1, border_color=COLOR_BORDER, text_color=COLOR_TEXT, font=self._t("label"), command=self.ios_import_saved_log_to_analysis).grid(row=0, column=3, pady=0)
+        ctk.CTkLabel(log_card, textvariable=self.ios_status_var, text_color=COLOR_MUTED, font=self._t("body")).grid(row=2, column=0, sticky="w", padx=SPACE_CARD, pady=(0, 4))
+        ctk.CTkLabel(log_card, textvariable=self.ios_log_file_var, text_color=COLOR_MUTED, wraplength=760, font=self._t("body")).grid(row=3, column=0, sticky="w", padx=SPACE_CARD, pady=(0, 8))
+        self.ios_log_box = ctk.CTkTextbox(log_card, height=260, corner_radius=RADIUS_CONTROL, border_width=1, border_color=COLOR_BORDER, fg_color=COLOR_SURFACE_2, text_color=COLOR_TEXT, font=self._t("body"))
+        self.ios_log_box.grid(row=4, column=0, columnspan=3, sticky="nsew", padx=SPACE_CARD, pady=(0, 18))
         self.ios_log_box.insert("end", "提示：Windows 抓取 iOS 日志需要 libimobiledevice 工具和 Apple Mobile Device Support / iTunes 驱动。\n")
         self.ios_log_box.configure(state="disabled")
         self._refresh_ios_log_button()
+        # 首次打开时自动检测工具（只查文件，很快），工具齐全再在后台检测设备。
+        self.after(200, self._ios_auto_detect)
+
+    def _ios_auto_detect(self):
+        try:
+            self.ios_detect_tools()
+        except Exception as exc:
+            self.ios_tool_summary_var.set(f"⚠ 工具检测失败：{exc}")
+            return
+        if self._ios_auto_detect_done:
+            return
+        self._ios_auto_detect_done = True
+        if not self.ios_tools.missing_required_tools():
+            self.ios_detect_devices(silent=True)
+
+    def _toggle_ios_custom_paths(self):
+        frame = getattr(self, "ios_custom_paths_frame", None)
+        button = getattr(self, "ios_custom_paths_button", None)
+        if frame is None or button is None:
+            return
+        self.ios_custom_paths_visible = not self.ios_custom_paths_visible
+        if self.ios_custom_paths_visible:
+            frame.grid()
+            button.configure(text="收起路径 ▴")
+        else:
+            frame.grid_remove()
+            button.configure(text="自定义路径 ▾")
+
+    def _ios_save_and_detect_tools(self):
+        self.ios_save_tool_paths()
+        self.ios_detect_tools()
 
     def _sync_ios_tool_paths_from_ui(self):
         for name, var in self.ios_tool_path_vars.items():
@@ -5699,9 +6632,31 @@ class XiaoXinAssistant(ctk.CTk):
         self.ios_tool_status_var.set(text)
         if hasattr(self, "ios_tool_result_box") and self.ios_tool_result_box and self.ios_tool_result_box.winfo_exists():
             self._set_textbox_text(self.ios_tool_result_box, text)
-    def _run_ios_task(self, title, worker, on_success=None):
+        self._update_ios_tool_summary(data, missing)
+
+    def _update_ios_tool_summary(self, data, missing):
+        required = [name for name in data if "crashreport" not in name]
+        found = [name for name in required if data[name].get("exists")]
+        if missing:
+            summary = f"⚠ 缺少必要工具：{', '.join(missing)}（{len(found)}/{len(required)} 可用）"
+            color = COLOR_DANGER
+        else:
+            sources = sorted({str(data[name].get("source") or "") for name in required} - {""})
+            summary = f"✓ 必要工具已就绪（{len(found)}/{len(required)}）" + (f" · 来源：{'、'.join(sources)}" if sources else "")
+            color = COLOR_SUCCESS
+        self.ios_tool_summary_var.set(summary)
+        label = getattr(self, "ios_tool_summary_label", None)
+        if label is not None and label.winfo_exists():
+            label.configure(text_color=color)
+        # 缺工具时自动展开路径配置和检测详情。
+        if missing and not getattr(self, "ios_custom_paths_visible", True):
+            self._toggle_ios_custom_paths()
+
+    def _run_ios_task(self, title, worker, on_success=None, silent=False):
+        """Run an iOS command in a worker thread. silent=True: no error dialog, used for automatic detection."""
         if self.ios_busy.is_set():
-            self.ios_append_system_log("已有 iOS 操作正在执行，请稍后再试")
+            if not silent:
+                self.ios_append_system_log("已有 iOS 操作正在执行，请稍后再试")
             return
         self.ios_busy.set()
         self.ios_status_var.set(f"正在执行：{title}")
@@ -5720,7 +6675,8 @@ class XiaoXinAssistant(ctk.CTk):
                 def ok(exc=exc):
                     self.ios_append_system_log(f"失败：{title}｜{exc}")
                     self.ios_status_var.set("操作失败")
-                    messagebox.showerror("操作失败", str(exc))
+                    if not silent:
+                        messagebox.showerror("操作失败", str(exc))
             finally:
                 def done():
                     self.ios_busy.clear()
@@ -5732,7 +6688,7 @@ class XiaoXinAssistant(ctk.CTk):
                     self.ios_busy.clear()
         threading.Thread(target=run, daemon=True).start()
 
-    def ios_detect_devices(self):
+    def ios_detect_devices(self, silent=False):
         def worker():
             self._sync_ios_tool_paths_from_ui()
             return self.ios_tools.list_devices()
@@ -5744,7 +6700,7 @@ class XiaoXinAssistant(ctk.CTk):
                 self.ios_selected_udid_var.set(devices[0].udid)
             if hasattr(self, "ios_devices_box") and self.ios_devices_box.winfo_exists():
                 self._set_textbox_text(self.ios_devices_box, text)
-        self._run_ios_task("检测 iOS 设备", worker, success)
+        self._run_ios_task("检测 iOS 设备", worker, success, silent=silent)
 
     def _get_ios_keywords(self):
         keywords = [kw for kw, var in self.ios_keyword_vars.items() if var.get()]

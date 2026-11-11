@@ -28,6 +28,7 @@ class _FakeButton:
 
     def configure(self, **kwargs):
         self.options.update(kwargs)
+        self.configure_calls = getattr(self, "configure_calls", 0) + 1
 
 
 class _Packet:
@@ -104,6 +105,33 @@ class NetworkButtonStateTests(unittest.TestCase):
         running.clear()
         XiaoXinAssistant._refresh_network_button(app)
         self.assertEqual("▶  开始模拟", button.options["text"])
+
+    def test_refresh_skips_redraw_when_state_is_unchanged(self):
+        running = threading.Event()
+        button = _FakeButton()
+        locked_calls = []
+        app = SimpleNamespace(
+            network=SimpleNamespace(running=running),
+            network_button=button,
+            _set_network_controls_locked=locked_calls.append,
+        )
+
+        for _ in range(5):
+            XiaoXinAssistant._refresh_network_button(app)
+        self.assertEqual(1, button.configure_calls)
+        self.assertEqual([False], locked_calls)
+
+        running.set()
+        XiaoXinAssistant._refresh_network_button(app)
+        XiaoXinAssistant._refresh_network_button(app)
+        self.assertEqual(2, button.configure_calls)
+        self.assertEqual("■  停止模拟", button.options["text"])
+        self.assertEqual([False, True], locked_calls)
+
+        # A rebuilt page has a new button, which must be configured again.
+        app.network_button = _FakeButton()
+        XiaoXinAssistant._refresh_network_button(app)
+        self.assertEqual(1, app.network_button.configure_calls)
 
     def test_worker_reports_running_only_after_windivert_open_confirms(self):
         release_open = threading.Event()
