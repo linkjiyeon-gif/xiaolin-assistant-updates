@@ -1,16 +1,17 @@
 {
-  "version": "2.4.40",
-  "build": 2440,
-  "published_at": "2026-11-06",
-  "installer_url": "https://github.com/linkjiyeon-gif/xiaolin-assistant-updates/releases/download/v2.4.40/XiaoLinAssistant_Setup_v2.4.40.exe",
-  "size": 44161291,
-  "sha256": "e6b6c0b1077abfc6a70114918a72b1b1b6a6f0619070ae2e6557f97170bfb9f7",
+  "version": "2.4.41",
+  "build": 2441,
+  "published_at": "2026-11-11",
+  "installer_url": "https://github.com/linkjiyeon-gif/xiaolin-assistant-updates/releases/download/v2.4.41/XiaoLinAssistant_Setup_v2.4.41.exe",
+  "size": 44197941,
+  "sha256": "8321342737944669d40d43c693cf5834cec3f058a31fefeb28a61fba1ebd7b88",
   "release_notes": [
-    "网络弱网支持同时拦截多个 IP，可填写网段和 IP 范围，启动前自动校验规则",
-    "优化 ADB / iOS 日志抓取时的界面流畅度，日志量大时减少卡顿",
-    "修复 iOS 日志显示满 3000 行后内容被反复批量删除的问题",
-    "日志分析结果合并刷新，确保最后一批命中会显示",
-    "运行日志限制保留行数，避免长时间运行后变慢",
-    "安装包内置 iOS 工具，安装后无需额外配置"
+    "整体界面改版：统一样式、导航图标和首页卡片，“正在运行”实时显示运行中的任务",
+    "启动和切换页面更流畅，打开时不再看到界面逐块刷新",
+    "网络弱网：目标 IP 支持多行粘贴，实时识别并标出格式错误",
+    "日志抓取 / ADB / iOS：打开页面自动检测设备，新增实时日志预览和识别前台应用",
+    "时间测试：新增常用海外时区（自动处理夏令时），输入即出结果，点击即可复制",
+    "鼠标连点：按钮启动前倒数 3 秒，支持按次数 / 时长自动停止",
+    "文件比对、配置表校验、多语言检查不再迭代，移到列表最后"
   ]
 }
