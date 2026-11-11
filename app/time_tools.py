@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import math
 import re
-from datetime import datetime, timedelta, timezone
-from typing import Dict, Tuple
+from datetime import datetime, timedelta, timezone, tzinfo
+from typing import Callable, Dict, Optional, Tuple
 
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -53,7 +53,7 @@ def detect_timestamp_unit(value: str, manual_unit: str = "自动识别") -> str:
     return "秒"
 
 
-def timestamp_to_datetime(value: str, unit: str = "自动识别") -> Dict[str, str]:
+def timestamp_to_datetime(value: str, unit: str = "自动识别", tz_option: str = "", custom_offset: str = "+8") -> Dict[str, str]:
     text = str(value).strip()
     if not text:
         raise ValueError("请输入时间戳")
@@ -68,13 +68,20 @@ def timestamp_to_datetime(value: str, unit: str = "自动识别") -> Dict[str, s
         local_dt = datetime.fromtimestamp(seconds, tz=local_timezone())
     except Exception as exc:
         raise ValueError("时间戳超出可转换范围") from exc
-    return {
+    result = {
         "unit": actual_unit,
         "local": format_datetime(local_dt),
         "utc": format_datetime(utc_dt),
         "seconds": str(int(seconds)),
         "milliseconds": str(int(seconds * 1000)),
     }
+    # 额外给出所选时区的时间（本地 / UTC 已经在上面）。
+    if tz_option and tz_option not in {"本地时区", "UTC"}:
+        zone_dt = datetime.fromtimestamp(seconds, tz=timezone_from_option(tz_option, custom_offset))
+        label = tz_option if tz_option != "自定义 UTC 偏移" else f"UTC{custom_offset}"
+        result["zone_label"] = f"{label}（{describe_offset(zone_dt)}）"
+        result["zone"] = format_datetime(zone_dt)
+    return result
 
 
 def parse_utc_offset(offset_text: str) -> timezone:
@@ -94,7 +101,104 @@ def parse_utc_offset(offset_text: str) -> timezone:
     return timezone(sign * timedelta(hours=hours, minutes=minutes))
 
 
-def timezone_from_option(option: str, custom_offset: str = "+8") -> timezone:
+# ---------------- 常用时区（含夏令时） ----------------
+# Windows 版 Python 没有自带时区数据库（zoneinfo 需要额外的 tzdata 包），
+# 这里直接实现几个常用时区现行的夏令时规则：
+#   美国：3 月第 2 个周日 02:00 至 11 月第 1 个周日 02:00（当地时间，2007 年起）
+#   欧盟 / 英国：3 月最后一个周日 01:00 UTC 至 10 月最后一个周日 01:00 UTC
+#   澳洲东部：10 月第 1 个周日 02:00 至次年 4 月第 1 个周日 03:00（当地时间）
+
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> datetime:
+    """n-th weekday (0=Mon) of a month; n=-1 means the last one. Returns a naive date at 00:00."""
+    if n > 0:
+        first = datetime(year, month, 1)
+        return first + timedelta(days=(weekday - first.weekday()) % 7 + 7 * (n - 1))
+    next_month = datetime(year + (month == 12), month % 12 + 1, 1)
+    last = next_month - timedelta(days=1)
+    return last - timedelta(days=(last.weekday() - weekday) % 7)
+
+
+def _us_dst_utc(year: int, std: timedelta) -> Tuple[datetime, datetime]:
+    start_local = _nth_weekday(year, 3, 6, 2) + timedelta(hours=2)  # 标准时间 02:00
+    end_local = _nth_weekday(year, 11, 6, 1) + timedelta(hours=2)  # 夏令时 02:00
+    return start_local - std, end_local - (std + timedelta(hours=1))
+
+
+def _eu_dst_utc(year: int, std: timedelta) -> Tuple[datetime, datetime]:
+    return _nth_weekday(year, 3, 6, -1) + timedelta(hours=1), _nth_weekday(year, 10, 6, -1) + timedelta(hours=1)
+
+
+def _au_dst_utc(year: int, std: timedelta) -> Tuple[datetime, datetime]:
+    # 南半球：夏令时跨年。返回本年 10 月开始、本年 4 月结束，判断时用“>= 开始 或 < 结束”。
+    start_local = _nth_weekday(year, 10, 6, 1) + timedelta(hours=2)
+    end_local = _nth_weekday(year, 4, 6, 1) + timedelta(hours=3)
+    return start_local - std, end_local - (std + timedelta(hours=1))
+
+
+class RuleTimezone(tzinfo):
+    """Fixed standard offset plus a yearly DST rule, enough for common game-server regions."""
+
+    def __init__(self, label: str, std_hours: float, rule: Optional[Callable] = None, southern: bool = False):
+        self.label = label
+        self.std = timedelta(hours=std_hours)
+        self.rule = rule
+        self.southern = southern
+
+    def _is_dst_utc(self, utc_naive: datetime) -> bool:
+        if self.rule is None:
+            return False
+        start, end = self.rule(utc_naive.year, self.std)
+        if self.southern:
+            return utc_naive >= start or utc_naive < end
+        return start <= utc_naive < end
+
+    def utcoffset(self, dt):
+        return self.std + self.dst(dt)
+
+    def dst(self, dt):
+        if dt is None or self.rule is None:
+            return timedelta(0)
+        # 按当地墙上时间判断：先当作标准时间换算到 UTC。重复的那一小时按标准时间处理。
+        return timedelta(hours=1) if self._is_dst_utc(dt.replace(tzinfo=None) - self.std) else timedelta(0)
+
+    def fromutc(self, dt):
+        utc_naive = dt.replace(tzinfo=None)
+        offset = self.std + (timedelta(hours=1) if self._is_dst_utc(utc_naive) else timedelta(0))
+        return (utc_naive + offset).replace(tzinfo=self)
+
+    def tzname(self, dt):
+        return self.label
+
+    def __repr__(self):
+        return f"RuleTimezone({self.label!r})"
+
+
+# 下拉框选项（保持旧选项名不变，旧配置和代码仍然可用）。
+NAMED_TIMEZONES: Dict[str, tzinfo] = {
+    "美西（洛杉矶）": RuleTimezone("美西（洛杉矶）", -8, _us_dst_utc),
+    "美东（纽约）": RuleTimezone("美东（纽约）", -5, _us_dst_utc),
+    "英国（伦敦）": RuleTimezone("英国（伦敦）", 0, _eu_dst_utc),
+    "中欧（巴黎 / 柏林）": RuleTimezone("中欧（巴黎 / 柏林）", 1, _eu_dst_utc),
+    "日本 / 韩国（UTC+9）": RuleTimezone("日本 / 韩国（UTC+9）", 9),
+    "澳洲东部（悉尼）": RuleTimezone("澳洲东部（悉尼）", 10, _au_dst_utc, southern=True),
+}
+TIMEZONE_OPTIONS = ["本地时区", "UTC", "UTC+8"] + list(NAMED_TIMEZONES) + ["自定义 UTC 偏移"]
+
+
+def describe_offset(dt: datetime) -> str:
+    """e.g. 'UTC-07:00，夏令时' for an aware datetime."""
+    offset = dt.utcoffset() or timedelta(0)
+    total = int(offset.total_seconds())
+    sign = "-" if total < 0 else "+"
+    hours, minutes = divmod(abs(total) // 60, 60)
+    text = f"UTC{sign}{hours:02d}:{minutes:02d}"
+    if isinstance(dt.tzinfo, RuleTimezone) and dt.tzinfo.rule is not None:
+        text += "，夏令时" if dt.dst() else "，标准时间"
+    return text
+
+
+def timezone_from_option(option: str, custom_offset: str = "+8") -> tzinfo:
     option = (option or "本地时区").strip()
     if option == "UTC":
         return timezone.utc
@@ -102,7 +206,14 @@ def timezone_from_option(option: str, custom_offset: str = "+8") -> timezone:
         return timezone(timedelta(hours=8))
     if option == "自定义 UTC 偏移":
         return parse_utc_offset(custom_offset)
+    if option in NAMED_TIMEZONES:
+        return NAMED_TIMEZONES[option]
     return local_timezone()
+
+
+def _seconds_between(start: datetime, end: datetime) -> int:
+    # 不用 end - start：同一个 tzinfo 时 Python 只按墙上时间相减，跨夏令时切换会差 1 小时。
+    return int(round(end.timestamp() - start.timestamp()))
 
 
 def parse_datetime_text(text: str, tz_option: str = "本地时区", custom_offset: str = "+8") -> datetime:
@@ -133,9 +244,10 @@ def parse_datetime_text(text: str, tz_option: str = "本地时区", custom_offse
 def datetime_to_timestamps(text: str, tz_option: str = "本地时区", custom_offset: str = "+8") -> Dict[str, str]:
     dt = parse_datetime_text(text, tz_option, custom_offset)
     seconds = int(dt.timestamp())
+    label = tz_option if tz_option != "自定义 UTC 偏移" else f"UTC{custom_offset}"
     return {
         "datetime": format_datetime(dt),
-        "timezone": tz_option if tz_option != "自定义 UTC 偏移" else f"UTC{custom_offset}",
+        "timezone": f"{label}（{describe_offset(dt)}）",
         "seconds": str(seconds),
         "milliseconds": str(seconds * 1000),
         "utc": format_datetime(dt.astimezone(timezone.utc)),
@@ -180,7 +292,7 @@ def readable_duration(total_seconds: int) -> str:
 def time_difference(start_text: str, end_text: str, tz_option: str = "本地时区", custom_offset: str = "+8") -> Dict[str, object]:
     start = parse_datetime_text(start_text, tz_option, custom_offset)
     end = parse_datetime_text(end_text, tz_option, custom_offset)
-    seconds = int((end - start).total_seconds())
+    seconds = _seconds_between(start, end)
     abs_seconds = abs(seconds)
     return {
         "is_negative": seconds < 0,
@@ -337,7 +449,7 @@ def add_or_subtract_time_parts(base_text: str, direction: str, days: str, hours:
 def countdown(current_text: str, end_text: str, tz_option: str = "本地时区", custom_offset: str = "+8") -> Dict[str, object]:
     current = datetime.now(local_timezone()) if not str(current_text).strip() else parse_datetime_text(current_text, tz_option, custom_offset)
     end = parse_datetime_text(end_text, tz_option, custom_offset)
-    remaining = int((end - current).total_seconds())
+    remaining = _seconds_between(current, end)
     ended = remaining <= 0
     display_seconds = max(0, remaining)
     days, hours, minutes, seconds = split_seconds(display_seconds)
@@ -353,7 +465,8 @@ def countdown(current_text: str, end_text: str, tz_option: str = "本地时区",
 
 
 def boundary_times(base_text: str, tz_option: str = "本地时区", custom_offset: str = "+8") -> Dict[str, datetime]:
-    base = datetime.now(local_timezone()) if not str(base_text).strip() else parse_datetime_text(base_text, tz_option, custom_offset)
+    # 留空时取“此刻”，但要换算到所选时区，否则跨天边界会按本机时区的 0 点算。
+    base = datetime.now(timezone_from_option(tz_option, custom_offset)) if not str(base_text).strip() else parse_datetime_text(base_text, tz_option, custom_offset)
     day_start = base.replace(hour=0, minute=0, second=0, microsecond=0)
     day_end = base.replace(hour=23, minute=59, second=59, microsecond=0)
     next_day_start = day_start + timedelta(days=1)

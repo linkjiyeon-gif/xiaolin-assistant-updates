@@ -2,8 +2,43 @@ from __future__ import annotations
 
 import unittest
 
-from app.network_filter import build_ip_condition, parse_ip_targets, summarize_ip_targets
+from app.network_filter import build_ip_condition, describe_ip_targets, parse_ip_targets, summarize_ip_targets
 from xiaoxin_assistant import NetworkWorker, ensure_windivert_impostor_guard
+
+
+class DescribeTargetsTests(unittest.TestCase):
+    def test_empty_input_explains_global_scope(self):
+        info = describe_ip_targets(" \n , ")
+        self.assertEqual("empty", info["status"])
+        self.assertIn("全部流量", info["message"])
+        self.assertEqual([], info["chips"])
+
+    def test_counts_ips_and_ranges_and_limits_chips(self):
+        text = "1.1.1.1\n2.2.2.2, 3.3.3.3 4.4.4.4；5.5.5.5\n6.6.6.6 10.0.0.0/24 1.1.1.1"
+        info = describe_ip_targets(text, max_chips=5)
+        self.assertEqual("ok", info["status"])
+        self.assertIn("已识别 7 个", info["message"])
+        self.assertIn("IP 6 · 网段 1", info["message"])
+        self.assertEqual(["1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4", "5.5.5.5"], info["chips"])
+        self.assertEqual(2, info["more"])
+        self.assertEqual("✓ 已识别 2 个", describe_ip_targets("1.1.1.1 2.2.2.2")["message"])
+
+    def test_cidr_chip_keeps_network_notation(self):
+        info = describe_ip_targets("10.0.0.5/24, 1.1.1.20-1.1.1.10")
+        self.assertEqual(["10.0.0.0/24", "1.1.1.10-1.1.1.20"], info["chips"])
+        self.assertIn("网段/范围", info["message"])
+
+    def test_invalid_items_are_listed_but_valid_ones_still_shown(self):
+        info = describe_ip_targets("1.1.1.1, abc, 1.1.1.1/99")
+        self.assertEqual("error", info["status"])
+        self.assertIn("2 项格式不正确", info["message"])
+        self.assertIn("abc", info["message"])
+        self.assertEqual(["1.1.1.1"], info["chips"])
+
+    def test_too_many_targets_warn_before_start(self):
+        text = ", ".join(f"10.1.{i // 250}.{i % 250 + 1}" for i in range(121))
+        self.assertEqual("warning", describe_ip_targets(text)["status"])
+        self.assertEqual("ok", describe_ip_targets(", ".join(f"10.0.0.{i}" for i in range(1, 121)))["status"])
 
 
 class NetworkFilterTests(unittest.TestCase):
